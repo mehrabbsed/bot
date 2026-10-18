@@ -1806,7 +1806,6 @@ async def date_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     await message.reply_text(text, parse_mode="Markdown")
 
-
 async def fal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_admin(update, context):
         return
@@ -1816,7 +1815,7 @@ async def fal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     try:
         if not Path("fales.json").exists():
-            await message.reply_text("⚠️ فایل فال‌ها (fales.json) پیدا نشد! لطفاً فایل را در پوشه ربات قرار دهید.")
+            await message.reply_text("⚠️ فایل فال‌ها (fales.json) پیدا نشد!")
             return
         fales = json.loads(Path("fales.json").read_text(encoding="utf-8"))
         if not fales:
@@ -1824,21 +1823,25 @@ async def fal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         chosen = random.choice(fales)
 
-        # --- محدود کردن شعر به ۶ بیت (۶ خط) ---
+        # ۶ بیت = ۱۲ مصرع
         poem_lines = [line.strip() for line in chosen["poem"].split("\n") if line.strip()]
-        six_lines = poem_lines[:6]
+        six_lines = poem_lines[:12]
         poem_text = "\n".join(six_lines)
 
+        # لاگ برای دیباگ
+        logger.info(f"FAL: {len(poem_lines)} lines found, showing {len(six_lines)}")
+
         text = (
-            "📜 **فال حافظ** 📜\n\n"
+            "📜 فال حافظ 📜\n\n"
             f"{poem_text}\n\n"
             "──────────────\n\n"
-            f"🔮 **تعبیر:** {chosen['tafsir']}"
+            f"🔮 تعبیر: {chosen['tafsir']}"
         )
-        await message.reply_text(text, parse_mode="Markdown")
+        await message.reply_text(text)   # بدون parse_mode
     except Exception as e:
         logger.error(f"خطا در خواندن فال: {e}")
         await message.reply_text("❌ خطایی در خواندن فال رخ داد.")
+
 
 async def say_janam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
