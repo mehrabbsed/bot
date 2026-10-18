@@ -1,6 +1,7 @@
 import random
 import logging
 import re
+import html
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import json
@@ -1577,7 +1578,7 @@ async def check_filter(update, context):
         if not word:
             continue
         pattern = r'(?<![^\W\d_])' + re.escape(word) + r'(?![^\W\d_])'
-        if re.search(pattern, text_lower, re.IGNORECASE):
+        if re.search(pattern, text_lower, re.IGNORECASE | re.UNICODE):
             try:
                 await message.delete()
             except TelegramError:
@@ -1586,8 +1587,21 @@ async def check_filter(update, context):
 
 
 # ==========================================
-# لیست‌های مدیریتی
+# لیست‌های مدیریتی (با HTML و escape امن)
 # ==========================================
+async def _safe_edit_or_reply(query, text, keyboard):
+    """تلاش می‌کنه edit کنه، اگه نشد پیام جدید بفرسته"""
+    try:
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode="HTML")
+        return
+    except TelegramError:
+        pass
+    try:
+        await query.message.reply_text(text, reply_markup=keyboard, parse_mode="HTML")
+    except TelegramError as e:
+        logger.exception(f"خطا در نمایش لیست: {e}")
+
+
 async def show_banned_list(update, context):
     query = update.callback_query
     if not query or not query.message:
@@ -1605,17 +1619,21 @@ async def show_banned_list(update, context):
     chat_id = str(chat.id)
     banned = data["banned"].get(chat_id, {})
 
-    text = "📊 **لیست افراد بن‌شده**\n\n"
+    text = "📊 <b>لیست افراد بن‌شده</b>\n\n"
 
     if not banned:
         text += "هیچ کاربری بن نشده است. ✅"
     else:
         items = []
         for uid, info in banned.items():
-            name = await get_user_display(chat.id, int(uid), context)
-            reason = info.get("reason", "نامشخص")
-            date = info.get("date", "نامشخص")
-            items.append(f"• {name}\n  🆔 `{uid}` | 📅 {date}\n  📝 {reason}")
+            name = html.escape(await get_user_display(chat.id, int(uid), context))
+            reason = html.escape(str(info.get("reason", "نامشخص")))
+            date = html.escape(str(info.get("date", "نامشخص")))
+            items.append(
+                f"• <b>{name}</b>\n"
+                f"  🆔 <code>{html.escape(uid)}</code> | 📅 {date}\n"
+                f"  📝 {reason}"
+            )
         text += "\n\n".join(items)
         text += f"\n\n📊 تعداد: {len(banned)}"
 
@@ -1623,10 +1641,7 @@ async def show_banned_list(update, context):
         [InlineKeyboardButton("🔙 برگشت", callback_data="menu_members")]
     ])
 
-    try:
-        await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
-    except TelegramError:
-        pass
+    await _safe_edit_or_reply(query, text, keyboard)
 
 
 async def show_muted_list(update, context):
@@ -1646,17 +1661,21 @@ async def show_muted_list(update, context):
     chat_id = str(chat.id)
     muted = data["muted"].get(chat_id, {})
 
-    text = "🔇 **لیست افراد سکوت‌شده**\n\n"
+    text = "🔇 <b>لیست افراد سکوت‌شده</b>\n\n"
 
     if not muted:
         text += "هیچ کاربری سکوت نشده است. ✅"
     else:
         items = []
         for uid, info in muted.items():
-            name = await get_user_display(chat.id, int(uid), context)
-            duration = info.get("duration", "نامشخص")
-            date = info.get("date", "نامشخص")
-            items.append(f"• {name}\n  🆔 `{uid}` | 📅 {date}\n  ⏱ مدت: {duration}")
+            name = html.escape(await get_user_display(chat.id, int(uid), context))
+            duration = html.escape(str(info.get("duration", "نامشخص")))
+            date = html.escape(str(info.get("date", "نامشخص")))
+            items.append(
+                f"• <b>{name}</b>\n"
+                f"  🆔 <code>{html.escape(uid)}</code> | 📅 {date}\n"
+                f"  ⏱ مدت: {duration}"
+            )
         text += "\n\n".join(items)
         text += f"\n\n📊 تعداد: {len(muted)}"
 
@@ -1664,10 +1683,7 @@ async def show_muted_list(update, context):
         [InlineKeyboardButton("🔙 برگشت", callback_data="menu_members")]
     ])
 
-    try:
-        await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
-    except TelegramError:
-        pass
+    await _safe_edit_or_reply(query, text, keyboard)
 
 
 async def show_warned_list(update, context):
@@ -1696,7 +1712,7 @@ async def show_warned_list(update, context):
         if c > 0:
             active_warns[uid] = c
 
-    text = "☠️ **لیست افراد دارای زهر**\n\n"
+    text = "☠️ <b>لیست افراد دارای زهر</b>\n\n"
 
     if not active_warns:
         text += "هیچ کاربری زهر ندارد. ✅"
@@ -1706,28 +1722,26 @@ async def show_warned_list(update, context):
             try:
                 member_info = await context.bot.get_chat_member(chat.id, int(uid))
                 user = member_info.user
-                name = user.first_name or "بدون نام"
-                username = f"@{user.username}" if user.username else "ندارد"
+                name = html.escape(user.first_name or "بدون نام")
+                username = f"@{html.escape(user.username)}" if user.username else "ندارد"
             except TelegramError:
                 name = "کاربر ناشناس"
                 username = "ندارد"
 
             items.append(
-                f"• **{name}** \n"
-                f"  username :  ({username}) | ⚠️ {count} از ۳"
+                f"• <b>{name}</b>\n"
+                f"  🆔 <code>{html.escape(uid)}</code>\n"
+                f"  username: ({username}) | ⚠️ {count} از ۳"
             )
 
-        text += "\n\n\n".join(items)
-        text += f"\n\n\n📊 تعداد: {len(active_warns)}"
+        text += "\n\n".join(items)
+        text += f"\n\n📊 تعداد: {len(active_warns)}"
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔙 برگشت", callback_data="menu_members")]
     ])
 
-    try:
-        await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
-    except TelegramError:
-        pass
+    await _safe_edit_or_reply(query, text, keyboard)
 
 
 # ==========================================
@@ -1751,6 +1765,16 @@ async def status_text(chat_id, context):
         f"⚠️ مجموع اخطارها: {warns_count}\n"
         f"🗣 سخنگو: {chatter_status}"
     )
+
+
+async def status_command(update, context):
+    """دکمه‌ی «📊 وضعیت گروه» پایین صفحه"""
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat:
+        return
+    text = await status_text(chat.id, context)
+    await message.reply_text(text)
 
 
 # ==========================================
@@ -2343,6 +2367,8 @@ async def tag_active(update, context):
 # ==========================================
 # پیام ناشناس
 # ==========================================
+import asyncio  # ← این رو بالای فایل اضافه کن (اگه نیست)
+
 async def anon_command(update, context):
     message = update.effective_message
     chat = update.effective_chat
@@ -2381,60 +2407,73 @@ async def anon_command(update, context):
         await reply_and_delete(update, "⚠️ متن خالیه یا خیلی طولانیه.")
         return
 
-    group_text = f"🕵️ **کاربر ناشناس**\n\n{anon_text}"
+    reply_to_msg_id = None
+    if message.reply_to_message:
+        reply_to_msg_id = message.reply_to_message.message_id
 
-    try:
-        if message.reply_to_message:
-            await context.bot.send_message(
-                chat_id=chat.id, text=group_text, parse_mode="Markdown",
-                reply_to_message_id=message.reply_to_message.message_id,
-            )
-        else:
-            await context.bot.send_message(chat_id=chat.id, text=group_text, parse_mode="Markdown")
-    except TelegramError as e:
-        logger.exception(f"خطا در ارسال پیام ناشناس: {e}")
-        await reply_and_delete(update, f"❌ خطا در ارسال: {e}")
-        return
-
-    try:
-        admins = await context.bot.get_chat_administrators(chat.id)
-    except TelegramError:
-        admins = []
-
-    admin_text = (
-        f"🕵️ **پیام ناشناس جدید**\n\n"
-        f"👥 گروه: {chat.title}\n"
-        f"👤 فرستنده: {user.mention_html()}\n"
-        f"🆔 آیدی: <code>{user.id}</code>\n"
-        f"📝 نام کاربری: @{user.username if user.username else 'ندارد'}\n\n"
-        f"💬 **متن پیام:**\n{anon_text}"
-    )
-
-    sent_to_admins = 0
-    for admin in admins:
-        if admin.user.is_bot or admin.user.id == user.id:
-            continue
-        try:
-            await context.bot.send_message(chat_id=admin.user.id, text=admin_text, parse_mode="HTML")
-            sent_to_admins += 1
-        except TelegramError:
-            continue
-
-    try:
-        with open("anon_logs.txt", "a", encoding="utf-8") as f:
-            f.write(f"{datetime.now()} | chat={chat.id} | user={user.id} | "
-                    f"name={user.first_name} | text={anon_text[:50]}\n")
-    except OSError:
-        pass
-
+    # ── ۱. فوری پیام کاربر رو پاک کن (بدون معطلی) ──
     try:
         await message.delete()
     except TelegramError:
         pass
 
-    logger.info(f"✅ پیام ناشناس ارسال شد | به {sent_to_admins} ادمین")
+    # ── ۲. هم‌زمان: پیام گروه + گرفتن ادمین‌ها رو موازی بفرست ──
+    group_text = f"🕵️ **کاربر ناشناس**\n\n{anon_text}"
 
+    async def send_to_group():
+        try:
+            if reply_to_msg_id:
+                await context.bot.send_message(
+                    chat_id=chat.id, text=group_text, parse_mode="Markdown",
+                    reply_to_message_id=reply_to_msg_id,
+                )
+            else:
+                await context.bot.send_message(chat_id=chat.id, text=group_text, parse_mode="Markdown")
+        except TelegramError as e:
+            logger.exception(f"خطا در ارسال پیام ناشناس: {e}")
 
+    async def get_admins():
+        try:
+            return await context.bot.get_chat_administrators(chat.id)
+        except TelegramError as e:
+            logger.error(f"❌ خطا در گرفتن ادمین‌ها: {e}")
+            return []
+
+    # اجرای موازی: پیام گروه + گرفتن ادمین‌ها
+    _, admins = await asyncio.gather(send_to_group(), get_admins())
+
+    # ── ۳. پیام به همه‌ی ادمین‌ها رو موازی بفرست ──
+    admin_text = (
+        f"🕵️ **پیام ناشناس جدید**\n\n"
+        f"👥 **گروه:** {chat.title}\n"
+        f"🆔 **آیدی گروه:** <code>{chat.id}</code>\n\n"
+        f"👤 **فرستنده اصلی:** {user.mention_html()}\n"
+        f"🆔 **آیدی:** <code>{user.id}</code>\n"
+        f"📝 **یوزرنیم:** @{user.username if user.username else 'ندارد'}\n\n"
+        f"💬 **متن پیام:**\n{anon_text}"
+    )
+
+    async def send_to_admin(admin):
+        if admin.user.is_bot or admin.user.id == user.id:
+            return 0
+        try:
+            await context.bot.send_message(chat_id=admin.user.id, text=admin_text, parse_mode="HTML")
+            return 1
+        except TelegramError:
+            return 0
+
+    results = await asyncio.gather(*[send_to_admin(a) for a in admins], return_exceptions=True)
+    sent_to_admins = sum(r for r in results if isinstance(r, int))
+
+    # ── ۴. لاگ (بدون await، فوری) ──
+    try:
+        with open("anon_logs.txt", "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now()} | chat={chat.id} | title={chat.title} | user={user.id} | "
+                    f"name={user.first_name} | sent={sent_to_admins} | text={anon_text[:50]}\n")
+    except OSError:
+        pass
+
+    logger.info(f"✅ پیام ناشناس از {chat.title} → {sent_to_admins} ادمین (موازی)")
 # ==========================================
 # main
 # ==========================================
@@ -2499,7 +2538,7 @@ def main() -> None:
 
     # ۹. دستورات فارسی
     app.add_handler(MessageHandler(filters.Regex(r"^تگ$"), tag_all), group=1)
-    app.add_handler(MessageHandler(filters.Regex(r"^تگ\s+.*$"), tag_all), group=1)
+    app.add_handler(MessageHandler(filters.Regex(r"^تگ\s+(?!ادمین|فعال).+$"), tag_all), group=1)
     app.add_handler(MessageHandler(filters.Regex(r"^تگ ادمین$"), tag_admins), group=1)
     app.add_handler(MessageHandler(filters.Regex(r"^تگ فعال$"), tag_active), group=1)
     app.add_handler(MessageHandler(filters.Regex(r"^فیلتر\s+.*$"), add_filter), group=1)
@@ -2545,15 +2584,6 @@ def main() -> None:
 
     logger.info("ربات در حال اجراست...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-async def status_command(update, context):
-    message = update.effective_message
-    chat = update.effective_chat
-    if not message or not chat:
-        return
-    text = await status_text(chat.id, context)
-    await message.reply_text(text)
 
 
 if __name__ == "__main__":
