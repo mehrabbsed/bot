@@ -1896,6 +1896,9 @@ async def say_janam(update, context):
         return
 
     await update.message.reply_text(f"جانم {user.first_name}؟ 💜")
+
+
+
 async def plain_mute_user(update, context):
     message = update.effective_message
     if not message or not message.text:
