@@ -945,18 +945,68 @@ async def save_identity_smart(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     target = message.reply_to_message.from_user
-    source_text = message.reply_to_message.text
+    replied = message.reply_to_message
 
-    if not source_text:
-        await message.reply_text("⚠️ پیامی که ریپلای کردی متن نداره!")
+    identity_value = None
+    kind_label = ""
+
+    # ۱. متن
+    if replied.text:
+        identity_value = replied.text.strip()
+        kind_label = "📝 متن"
+
+    # ۲. کپشن (عکس/ویدیو/فایل همراه کپشن)
+    elif replied.caption:
+        identity_value = replied.caption.strip()
+        kind_label = "💬 کپشن"
+
+    # ۳. عکس (بدون کپشن) → file_id
+    elif replied.photo:
+        identity_value = f"PHOTO:{replied.photo[-1].file_id}"
+        kind_label = "🖼 عکس"
+
+    # ۴. ویدیو
+    elif replied.video:
+        identity_value = f"VIDEO:{replied.video.file_id}"
+        kind_label = "🎬 ویدیو"
+
+    # ۵. ویدیونوت
+    elif replied.video_note:
+        identity_value = f"VIDEO_NOTE:{replied.video_note.file_id}"
+        kind_label = "🎥 ویدیونوت"
+
+    # ۶. ویس
+    elif replied.voice:
+        identity_value = f"VOICE:{replied.voice.file_id}"
+        kind_label = "🎤 ویس"
+
+    # ۷. فایل/سند
+    elif replied.document:
+        identity_value = f"DOCUMENT:{replied.document.file_id}"
+        kind_label = "📎 فایل"
+
+    # ۸. استیکر
+    elif replied.sticker:
+        identity_value = f"STICKER:{replied.sticker.file_id}"
+        kind_label = "🎨 استیکر"
+
+    if not identity_value:
+        await message.reply_text(
+            "⚠️ پیامی که ریپلای کردی هیچ محتوای قابل ثبت (متن، عکس، ویدیو، ویس، فایل، استیکر) نداره!"
+        )
         return
 
     key = identity_key(chat.id, target.id)
-    data["identities"][key] = source_text.strip()[:300]
+    data["identities"][key] = identity_value[:4000]  # سقف بالا برای کپشن‌های طولانی
     save_data()
 
-    await reply_and_delete(update, f"✅ هویت {target.first_name} ثبت شد:\n\n{source_text[:100]}...")
-
+    preview = identity_value[:100]
+    await reply_and_delete(
+        update,
+        f"✅ هویت {target.first_name} ثبت شد.\n"
+        f"نوع: {kind_label}\n\n"
+        f"{preview}{'...' if len(identity_value) > 100 else ''}"
+    )
 
 async def show_identity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
