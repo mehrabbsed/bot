@@ -29,9 +29,16 @@ from telegram.ext import (
 )
 
 # ==========================================
+# هوش مصنوعی (Gemini)
+# ==========================================
+from google import genai
+from google.genai import types as genai_types
+
+# ==========================================
 # تنظیمات اصلی
 # ==========================================
 TOKEN = "8243532879:AAGiI169Ra-rvkUHV3YRPuekwL_1Y3kmC4c"
+GEMINI_API_KEY = "کلید_گمینی_خودت_رو_بذار_اینجا"   # ← اینجا کلید رو بذار
 DATA_FILE = Path("bot_data.json")
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -42,13 +49,29 @@ logger = logging.getLogger(__name__)
 # ==========================================
 ALLOWED_CHATS = {
     -1003910964288,   # ← آیدی گروه اول
-    -1004435184288,   # ← آیدی گروه دوم (عوضش کن)
+    -1004435184288,   # ← آیدی گروه دوم
 }
 
 
 def is_allowed_chat(chat_id) -> bool:
-    """چک می‌کنه که چت مجازه یا نه"""
     return chat_id in ALLOWED_CHATS
+
+
+# ==========================================
+# کلاینت هوش مصنوعی
+# ==========================================
+_ai_client = None
+
+
+def get_ai_client():
+    global _ai_client
+    if _ai_client is None and GEMINI_API_KEY and "کلید_گمینی" not in GEMINI_API_KEY:
+        try:
+            _ai_client = genai.Client(api_key=GEMINI_API_KEY)
+        except Exception:
+            logger.exception("خطا در ساخت کلاینت Gemini")
+            _ai_client = None
+    return _ai_client
 
 
 # ==========================================
@@ -57,7 +80,8 @@ def is_allowed_chat(chat_id) -> bool:
 data = {
     "warns": {}, "identities": {}, "filters": {}, "locks": {},
     "special": {}, "custom_lock_text": {}, "last_messages": {},
-    "message_counts": {}, "join_dates": {}
+    "message_counts": {}, "join_dates": {},
+    "chatter": {},          # ← وضعیت سخنگو per-chat
 }
 
 
@@ -186,6 +210,67 @@ async def apply_locks(chat, context):
 
 
 # ==========================================
+# سخنگو (Chatter) — با هوش مصنوعی
+# ==========================================
+CHATTER_SYSTEM_PROMPT = (
+    "تو یک ربات مدیر گروه تلگرامی هستی به نام «اتر» (Ether). "
+    "شخصیتت: مهربان، کمی شوخ، صمیمی، باکلاس، فارسی‌زبان محاوره‌ای. "
+    "وقتی کسی روی پیامت ریپلای می‌کنه، باید کوتاه (حداکثر ۲ جمله)، "
+    "طبیعی، دوستانه و مرتبط با حرف طرف جواب بدی. "
+    "از ایموجی‌های مناسب (۱ تا ۳ تا) استفاده کن. "
+    "هرگز نگو «من یک هوش مصنوعی هستم» یا «من یک مدل زبانی هستم». "
+    "اگه پیام طرف توهین‌آمیز بود، مؤدبانه و کوتاه جواب بده."
+)
+
+CHATTER_FALLBACKS = [
+    "جانم؟ 🌸 چیزی گفتی عزیزم؟",
+    "بله قربان! در خدمتم 🫡",
+    "چشم، هرچی تو بگی ✨",
+    "من اینجام، همیشه پای تو 🫶",
+    "حرف بزن، گوش می‌دم 🎧",
+    "چه خبر؟ 🌟",
+]
+
+
+async def generate_chatter_reply(user_text: str, user_name: str) -> str:
+    fallback = random.choice(CHATTER_FALLBACKS)
+    client = get_ai_client()
+    if client is None:
+        return fallback
+
+    prompt = (
+        f"کاربر «{user_name}» روی پیام تو ریپلای کرده و نوشته:\n"
+        f"«{user_text[:800]}»\n\n"
+        f"حالا تو یه جواب کوتاه، صمیمی و طبیعی بده."
+    )
+
+    try:
+        response = await client.aio.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=CHATTER_SYSTEM_PROMPT,
+                max_output_tokens=120,
+                temperature=0.95,
+            ),
+        )
+        text = (response.text or "").strip()
+        return text if text else fallback
+    except Exception as e:
+        logger.exception(f"خطا در هوش مصنوعی سخنگو: {e}")
+        return fallback
+
+
+def is_chatter_on(chat_id) -> bool:
+    return bool(data["chatter"].get(chat_key(chat_id), False))
+
+
+def set_chatter(chat_id, enabled: bool):
+    data["chatter"][chat_key(chat_id)] = enabled
+    save_data()
+
+
+# ==========================================
 # منوهای پنل
 # ==========================================
 def main_keyboard(chat_id):
@@ -263,8 +348,20 @@ def settings_keyboard(chat_id):
             callback_data="quiet_on",
         )
 
+    if is_chatter_on(chat_id):
+        chatter_btn = InlineKeyboardButton(
+            "🟢 سخنگو فعال — خاموش کردن",
+            callback_data="chatter_off",
+        )
+    else:
+        chatter_btn = InlineKeyboardButton(
+            "🔴 سخنگو غیرفعال — فعال کردن",
+            callback_data="chatter_on",
+        )
+
     return InlineKeyboardMarkup([
         [quiet_btn],
+        [chatter_btn],
         [InlineKeyboardButton("✏️ تغییر متن قفل گروه", callback_data="set_lock_text")],
         [InlineKeyboardButton("🚫 فیلتر کلمات", callback_data="menu_filters")],
         [InlineKeyboardButton("💎 راهنمای ویژه", callback_data="special_info")],
@@ -334,19 +431,16 @@ async def hide_bottom_keyboard(update: Update, context: ContextTypes.DEFAULT_TYP
 # 🔒 بلاک گروه‌های غیرمجاز
 # ==========================================
 async def block_unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """اگه گروه مجاز نبود، ربات هیچ کاری نکنه"""
     chat = update.effective_chat
     if not chat:
         return
 
-    # توی PV کاری نکن (چون PV برای خودت آزاده)
     if chat.type == ChatType.PRIVATE:
         return
 
     if not is_allowed_chat(chat.id):
         logger.warning(f"⛔ پیام از گروه غیرمجاز: {chat.id} ({chat.title})")
 
-        # فقط یه بار پیام بده
         if update.effective_message:
             try:
                 await update.effective_message.reply_text(
@@ -355,7 +449,6 @@ async def block_unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE)
             except TelegramError:
                 pass
 
-        # بلاک کن — هیچ هندلر دیگه‌ای اجرا نشه
         raise ApplicationHandlerStop
 
 
@@ -425,7 +518,9 @@ async def help_command(update, context):
         "ناشناس متن — پیام ناشناس\n\n"
         "قفل و باز کردن گروه:\n"
         "کرکره پایین — قفل گروه\n"
-        "گشایش — باز کردن گروه"
+        "گشایش — باز کردن گروه\n\n"
+        "🗣 سخنگو:\n"
+        "از پنل → تنظیمات فعال/غیرفعال کن. بعدش روی پیام ربات ریپلای کن تا جواب بده."
     )
     await reply_and_delete(update, text)
 
@@ -497,7 +592,6 @@ async def member_action(update, context, action):
 
     try:
         if action in ("kick", "ban"):
-            # چک: ادمین رو اخراج نکن
             try:
                 target_member = await context.bot.get_chat_member(chat.id, target.id)
                 if target_member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
@@ -542,7 +636,6 @@ async def member_action(update, context, action):
             return
 
         elif action == "mute":
-            # چک: ادمین رو سکوت نکن
             try:
                 target_member = await context.bot.get_chat_member(chat.id, target.id)
                 if target_member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
@@ -577,10 +670,7 @@ async def member_action(update, context, action):
                 use_independent_chat_permissions=True,
             )
 
-            if minutes:
-                duration_text = f"{minutes} دقیقه"
-            else:
-                duration_text = "دائمی"
+            duration_text = f"{minutes} دقیقه" if minutes else "دائمی"
 
             answer = (
                 f"دوره‌ی نقاهتِ زبونت به مدت {duration_text} شروع شد 🤫\n\n"
@@ -803,8 +893,6 @@ async def profile_user(update, context):
 # خوش‌آمدگویی
 # ==========================================
 async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.warning("🔴🔴🔴 WELCOME HANDLER CALLED 🔴🔴🔴")
-
     if not update.chat_member:
         return
 
@@ -815,9 +903,7 @@ async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
 
-    # 🔒 چک گروه مجاز
     if not is_allowed_chat(chat.id):
-        logger.warning(f"⛔ گروه مجاز نیست: {chat.id}")
         return
 
     if member.is_bot:
@@ -830,12 +916,6 @@ async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE
     new_status = new.status
     old_is_member = getattr(old, "is_member", False)
     new_is_member = getattr(new, "is_member", False)
-
-    logger.warning(
-        f"🔍 {member.first_name} (id={member.id}) | "
-        f"old={old_status}(is_member={old_is_member}) → "
-        f"new={new_status}(is_member={new_is_member})"
-    )
 
     was_outside = (old_status == ChatMemberStatus.LEFT) or (
         old_status == ChatMemberStatus.RESTRICTED and not old_is_member
@@ -850,10 +930,7 @@ async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE
     joined = was_outside and is_inside_now
 
     if not joined:
-        logger.warning(f"🔴 رد شد: عضو جدید/برگشتی نیست")
         return
-
-    logger.warning("🔴✅ عضو جدید تشخیص داده شد!")
 
     ck = chat_key(chat.id)
     uk = user_key(member.id)
@@ -900,9 +977,8 @@ async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE
             text=welcome_text,
             parse_mode="HTML",
         )
-        logger.warning(f"✅✅✅ خوش‌آمد ارسال شد | {member.first_name}")
     except TelegramError as e:
-        logger.exception(f"❌❌❌ خطا در ارسال: {e}")
+        logger.exception(f"خطا در ارسال خوش‌آمد: {e}")
 
 
 # ==========================================
@@ -914,7 +990,6 @@ async def count_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
 
-    # 🔒 چک گروه مجاز
     if not is_allowed_chat(update.effective_chat.id):
         return
 
@@ -927,6 +1002,51 @@ async def count_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if data["message_counts"][key] % 5 == 0:
         save_data()
+
+
+# ==========================================
+# سخنگو — جواب دادن به ریپلای روی پیام ربات
+# ==========================================
+async def chatter_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not message or not chat or not user:
+        return
+
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    if not is_allowed_chat(chat.id):
+        return
+    if not is_chatter_on(chat.id):
+        return
+
+    replied = message.reply_to_message
+    if not replied or not replied.from_user:
+        return
+    if replied.from_user.id != context.bot.id:
+        return
+    if user.is_bot:
+        return
+
+    user_text = (message.text or message.caption or "").strip()
+    if not user_text:
+        user_text = "(پیام غیرمتنی فرستاد)"
+
+    try:
+        await context.bot.send_chat_action(chat.id, "typing")
+    except TelegramError:
+        pass
+
+    reply_text = await generate_chatter_reply(user_text, user.first_name)
+
+    try:
+        await message.reply_text(
+            reply_text,
+            reply_to_message_id=message.message_id,
+        )
+    except TelegramError as e:
+        logger.exception(f"خطا در ارسال جواب سخنگو: {e}")
 
 
 # ==========================================
@@ -950,45 +1070,38 @@ async def save_identity_smart(update: Update, context: ContextTypes.DEFAULT_TYPE
     identity_value = None
     kind_label = ""
 
-    # ۱. عکس (با یا بدون کپشن) → file_id + کپشن
     if replied.photo:
         file_id = replied.photo[-1].file_id
         caption = (replied.caption or "").strip()
         identity_value = f"PHOTO:{file_id}|CAPTION|{caption}" if caption else f"PHOTO:{file_id}"
         kind_label = "🖼 عکس" + (" + 💬 کپشن" if caption else "")
 
-    # ۲. ویدیو
     elif replied.video:
         file_id = replied.video.file_id
         caption = (replied.caption or "").strip()
         identity_value = f"VIDEO:{file_id}|CAPTION|{caption}" if caption else f"VIDEO:{file_id}"
         kind_label = "🎬 ویدیو" + (" + 💬 کپشن" if caption else "")
 
-    # ۳. ویدیونوت
     elif replied.video_note:
         identity_value = f"VIDEO_NOTE:{replied.video_note.file_id}"
         kind_label = "🎥 ویدیونوت"
 
-    # ۴. ویس
     elif replied.voice:
         file_id = replied.voice.file_id
         caption = (replied.caption or "").strip()
         identity_value = f"VOICE:{file_id}|CAPTION|{caption}" if caption else f"VOICE:{file_id}"
         kind_label = "🎤 ویس" + (" + 💬 کپشن" if caption else "")
 
-    # ۵. فایل/سند
     elif replied.document:
         file_id = replied.document.file_id
         caption = (replied.caption or "").strip()
         identity_value = f"DOCUMENT:{file_id}|CAPTION|{caption}" if caption else f"DOCUMENT:{file_id}"
         kind_label = "📎 فایل" + (" + 💬 کپشن" if caption else "")
 
-    # ۶. استیکر
     elif replied.sticker:
         identity_value = f"STICKER:{replied.sticker.file_id}"
         kind_label = "🎨 استیکر"
 
-    # ۷. فقط متن
     elif replied.text:
         identity_value = replied.text.strip()
         kind_label = "📝 متن"
@@ -1010,14 +1123,12 @@ async def save_identity_smart(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"نوع: {kind_label}\n\n"
         f"{preview}{'...' if len(identity_value) > 100 else ''}"
     )
+
+
 def _split_identity(identity: str):
-    """جدا کردن نوع، file_id و کپشن از رشته‌ی ذخیره‌شده"""
     prefix = ""
     file_id = ""
     caption = ""
-
-    if ":" in identity and not identity.startswith("PHOTO:") is False:
-        pass
 
     for p in ("PHOTO", "VIDEO", "VIDEO_NOTE", "VOICE", "DOCUMENT", "STICKER"):
         if identity.startswith(f"{p}:"):
@@ -1029,7 +1140,7 @@ def _split_identity(identity: str):
                 file_id = rest
             return prefix, file_id, caption
 
-    return None, "", identity  # متن خالص
+    return None, "", identity
 
 
 async def show_identity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1054,7 +1165,6 @@ async def show_identity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     prefix, file_id, caption = _split_identity(identity)
 
-    # --- نمایش رسانه با کپشن ---
     if prefix == "PHOTO":
         await message.reply_photo(
             photo=file_id,
@@ -1111,8 +1221,9 @@ async def show_identity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await message.reply_sticker(sticker=file_id)
         return
 
-    # متن خالص
     await reply_and_delete(update, f"🆔 **هویت {target.first_name}:**\n\n{identity}")
+
+
 # ==========================================
 # قفل گروه
 # ==========================================
@@ -1339,7 +1450,6 @@ async def check_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
 
-    # 🔒 چک گروه مجاز
     if not is_allowed_chat(chat.id):
         return
 
@@ -1348,7 +1458,6 @@ async def check_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not message.text:
         return
 
-    # ⚠️ اگه پیام با دستورات ناشناس شروع می‌شه، رد کن
     if message.text.startswith(("/anon", "ناشناس", "پیام مخفی", "/", "تگ")):
         return
 
@@ -1445,11 +1554,14 @@ async def status_text(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> str:
             warns_count += sum(1 for w in warns.values() if w > 0)
     enabled_locks = [name for name, enabled in locks.items() if enabled]
 
+    chatter_status = "🟢 فعال" if is_chatter_on(chat_id) else "🔴 غیرفعال"
+
     return (
         "📊 وضعیت گروه\n\n"
         f"🔒 قفل‌های فعال: {', '.join(enabled_locks) if enabled_locks else 'هیچ‌کدام'}\n"
         f"🚫 تعداد فیلترها: {filters_count}\n"
-        f"⚠️ مجموع اخطارها: {warns_count}"
+        f"⚠️ مجموع اخطارها: {warns_count}\n"
+        f"🗣 سخنگو: {chatter_status}"
     )
 
 
@@ -1459,7 +1571,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     chat = query.message.chat
 
-    # 🔒 چک گروه مجاز
     if not is_allowed_chat(chat.id):
         await query.answer("⛔ این ربات فقط توی گروه‌های مجاز کار می‌کنه.", show_alert=True)
         return
@@ -1524,7 +1635,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 "`فیلتر [کلمه]`\n"
                 "`حذف فیلتر [کلمه]`\n"
                 "`تاریخ`\n"
-                "`فال`"
+                "`فال`\n\n"
+                "🗣 با دکمه‌ی «سخنگو» می‌تونی ربات رو حالتی کنی که به ریپلای‌های روی پیام‌هاش با هوش مصنوعی جواب بده."
             )
             await query.edit_message_text(text, reply_markup=settings_keyboard(chat.id))
             return
@@ -1612,6 +1724,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 "🔹 **قفل گروه:**\n"
                 "`کرکره پایین` — قفل گروه\n"
                 "`گشایش` — باز کردن گروه\n\n"
+                "🔹 **سخنگو:**\n"
+                "از پنل → تنظیمات فعال/غیرفعال کن. بعدش روی پیام ربات ریپلای کن تا با هوش مصنوعی جواب بده.\n\n"
                 "🔹 **پنل:**\n"
                 "`/panel` یا `پنل` — باز کردن پنل",
                 reply_markup=main_keyboard(chat.id),
@@ -1644,6 +1758,25 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 await query.answer("روی پیامی که حاوی هویت هست ریپلای کن و بنویس: ثبت هویت", show_alert=True)
             elif action == "id_check":
                 await query.answer("روی پیام شخص ریپلای کن و بنویس: هویت", show_alert=True)
+            return
+
+        # ── سخنگو ──
+        if action == "chatter_on":
+            set_chatter(chat.id, True)
+            await query.answer("🗣 سخنگو فعال شد. حالا روی پیام ربات ریپلای کن تا جواب بده.")
+            try:
+                await query.edit_message_reply_markup(reply_markup=settings_keyboard(chat.id))
+            except TelegramError:
+                pass
+            return
+
+        if action == "chatter_off":
+            set_chatter(chat.id, False)
+            await query.answer("🤐 سخنگو غیرفعال شد.")
+            try:
+                await query.edit_message_reply_markup(reply_markup=settings_keyboard(chat.id))
+            except TelegramError:
+                pass
             return
 
         locks = get_locks(chat.id)
@@ -1806,6 +1939,7 @@ async def date_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     await message.reply_text(text, parse_mode="Markdown")
 
+
 async def fal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_admin(update, context):
         return
@@ -1823,12 +1957,10 @@ async def fal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         chosen = random.choice(fales)
 
-        # ۶ بیت = ۱۲ مصرع
         poem_lines = [line.strip() for line in chosen["poem"].split("\n") if line.strip()]
         six_lines = poem_lines[:12]
         poem_text = "\n".join(six_lines)
 
-        # لاگ برای دیباگ
         logger.info(f"FAL: {len(poem_lines)} lines found, showing {len(six_lines)}")
 
         text = (
@@ -1837,7 +1969,7 @@ async def fal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "──────────────\n\n"
             f"🔮 تعبیر: {chosen['tafsir']}"
         )
-        await message.reply_text(text)   # بدون parse_mode
+        await message.reply_text(text)
     except Exception as e:
         logger.error(f"خطا در خواندن فال: {e}")
         await message.reply_text("❌ خطایی در خواندن فال رخ داد.")
@@ -2146,9 +2278,6 @@ async def anon_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await reply_and_delete(update, "⚠️ متن خیلی طولانیه (حداکثر ۴۰۰۰ کاراکتر).")
         return
 
-    # ========================================
-    # ۱. ارسال به گروه (ناشناس برای همه)
-    # ========================================
     group_text = f"🕵️ **کاربر ناشناس**\n\n{anon_text}"
 
     try:
@@ -2170,9 +2299,6 @@ async def anon_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await reply_and_delete(update, f"❌ خطا در ارسال: {e}")
         return
 
-    # ========================================
-    # ۲. ارسال به PV هر ادمین (با اسم واقعی)
-    # ========================================
     try:
         admins = await context.bot.get_chat_administrators(chat.id)
     except TelegramError:
@@ -2204,9 +2330,6 @@ async def anon_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         except TelegramError:
             continue
 
-    # ========================================
-    # ۳. لاگ مخفی
-    # ========================================
     try:
         with open("anon_logs.txt", "a", encoding="utf-8") as f:
             f.write(
@@ -2217,9 +2340,6 @@ async def anon_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except OSError:
         pass
 
-    # ========================================
-    # ۴. حذف دستور کاربر
-    # ========================================
     try:
         await message.delete()
     except TelegramError:
@@ -2236,11 +2356,14 @@ def main() -> None:
     if not TOKEN_STR:
         raise RuntimeError("توکن تنظیم نشده است.")
 
+    if not GEMINI_API_KEY or "کلید_گمینی" in GEMINI_API_KEY:
+        logger.warning("⚠️ GEMINI_API_KEY تنظیم نشده — سخنگو فقط از جواب‌های آماده استفاده می‌کنه.")
+
     load_data()
 
     app = Application.builder().token(TOKEN_STR).build()
 
-    # ۰. 🔒 بلاک گروه‌های غیرمجاز (اول از همه!)
+    # ۰. 🔒 بلاک گروه‌های غیرمجاز
     app.add_handler(MessageHandler(filters.ALL, block_unauthorized), group=-1)
 
     # ۱. دستورات اسلش
@@ -2271,7 +2394,7 @@ def main() -> None:
     # ۲. دکمه‌های شیشه‌ای
     app.add_handler(CallbackQueryHandler(callback_handler))
 
-    # ۳. اول پیام ناشناس (قبل از check_filter!)
+    # ۳. اول پیام ناشناس (قبل از check_filter)
     app.add_handler(MessageHandler(filters.Regex(r"^/anon\s+.*$"), anon_command), group=0)
     app.add_handler(MessageHandler(filters.Regex(r"^ناشناس\s+.*$"), anon_command), group=0)
     app.add_handler(MessageHandler(filters.Regex(r"^پیام مخفی\s+.*$"), anon_command), group=0)
@@ -2281,6 +2404,12 @@ def main() -> None:
 
     # ۵. خوش آمدگویی
     app.add_handler(ChatMemberHandler(welcome_new_members, ChatMemberHandler.CHAT_MEMBER))
+
+    # ۵.۵ سخنگو — ریپلای روی پیام ربات (گروه ۲، جدا برای جلوگیری از تداخل)
+    app.add_handler(
+        MessageHandler(filters.REPLY & ~filters.COMMAND, chatter_reply),
+        group=2,
+    )
 
     # ۶. فیلتر کلمات (گروه ۰) - بعد از ناشناس
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_filter), group=0)
