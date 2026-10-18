@@ -1024,11 +1024,69 @@ async def show_identity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     key = identity_key(chat.id, target.id)
     identity = data["identities"].get(key)
 
-    if identity:
-        await reply_and_delete(update, f"🆔 **هویت {target.first_name}:**\n\n{identity}")
-    else:
+    if not identity:
         await reply_and_delete(update, "❓ برای این شخص هویتی ثبت نشده است.")
+        return
 
+    # اگه رسانه ذخیره شده بود
+    if identity.startswith("PHOTO:"):
+        await message.reply_photo(
+            photo=identity.split(":", 1)[1],
+            caption=f"🆔 **هویت {target.first_name}** (🖼 عکس)",
+            parse_mode="Markdown",
+        )
+        try:
+            await message.delete()
+        except TelegramError:
+            pass
+        return
+
+    if identity.startswith("VIDEO:"):
+        await message.reply_video(
+            video=identity.split(":", 1)[1],
+            caption=f"🆔 **هویت {target.first_name}** (🎬 ویدیو)",
+            parse_mode="Markdown",
+        )
+        try:
+            await message.delete()
+        except TelegramError:
+            pass
+        return
+
+    if identity.startswith("VIDEO_NOTE:"):
+        await message.reply_video_note(video_note=identity.split(":", 1)[1])
+        return
+
+    if identity.startswith("VOICE:"):
+        await message.reply_voice(
+            voice=identity.split(":", 1)[1],
+            caption=f"🆔 **هویت {target.first_name}** (🎤 ویس)",
+            parse_mode="Markdown",
+        )
+        try:
+            await message.delete()
+        except TelegramError:
+            pass
+        return
+
+    if identity.startswith("DOCUMENT:"):
+        await message.reply_document(
+            document=identity.split(":", 1)[1],
+            caption=f"🆔 **هویت {target.first_name}** (📎 فایل)",
+            parse_mode="Markdown",
+        )
+        try:
+            await message.delete()
+        except TelegramError:
+            pass
+        return
+
+    if identity.startswith("STICKER:"):
+        await message.reply_sticker(sticker=identity.split(":", 1)[1])
+        return
+
+    # متن یا کپشن
+    await reply_and_delete(update, f"🆔 **هویت {target.first_name}:**\n\n{identity}")
 
 # ==========================================
 # قفل گروه
