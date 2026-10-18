@@ -1823,9 +1823,15 @@ async def fal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await message.reply_text("⚠️ فایل فال‌ها خالی است!")
             return
         chosen = random.choice(fales)
+
+        # --- محدود کردن شعر به ۶ بیت (۶ خط) ---
+        poem_lines = [line.strip() for line in chosen["poem"].split("\n") if line.strip()]
+        six_lines = poem_lines[:6]
+        poem_text = "\n".join(six_lines)
+
         text = (
             "📜 **فال حافظ** 📜\n\n"
-            f"{chosen['poem']}\n\n"
+            f"{poem_text}\n\n"
             "──────────────\n\n"
             f"🔮 **تعبیر:** {chosen['tafsir']}"
         )
@@ -1833,7 +1839,6 @@ async def fal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception as e:
         logger.error(f"خطا در خواندن فال: {e}")
         await message.reply_text("❌ خطایی در خواندن فال رخ داد.")
-
 
 async def say_janam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
