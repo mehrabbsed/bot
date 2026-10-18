@@ -950,45 +950,48 @@ async def save_identity_smart(update: Update, context: ContextTypes.DEFAULT_TYPE
     identity_value = None
     kind_label = ""
 
-    # ۱. متن
-    if replied.text:
-        identity_value = replied.text.strip()
-        kind_label = "📝 متن"
+    # ۱. عکس (با یا بدون کپشن) → file_id + کپشن
+    if replied.photo:
+        file_id = replied.photo[-1].file_id
+        caption = (replied.caption or "").strip()
+        identity_value = f"PHOTO:{file_id}|CAPTION|{caption}" if caption else f"PHOTO:{file_id}"
+        kind_label = "🖼 عکس" + (" + 💬 کپشن" if caption else "")
 
-    # ۲. کپشن (عکس/ویدیو/فایل همراه کپشن)
-    elif replied.caption:
-        identity_value = replied.caption.strip()
-        kind_label = "💬 کپشن"
-
-    # ۳. عکس (بدون کپشن) → file_id
-    elif replied.photo:
-        identity_value = f"PHOTO:{replied.photo[-1].file_id}"
-        kind_label = "🖼 عکس"
-
-    # ۴. ویدیو
+    # ۲. ویدیو
     elif replied.video:
-        identity_value = f"VIDEO:{replied.video.file_id}"
-        kind_label = "🎬 ویدیو"
+        file_id = replied.video.file_id
+        caption = (replied.caption or "").strip()
+        identity_value = f"VIDEO:{file_id}|CAPTION|{caption}" if caption else f"VIDEO:{file_id}"
+        kind_label = "🎬 ویدیو" + (" + 💬 کپشن" if caption else "")
 
-    # ۵. ویدیونوت
+    # ۳. ویدیونوت
     elif replied.video_note:
         identity_value = f"VIDEO_NOTE:{replied.video_note.file_id}"
         kind_label = "🎥 ویدیونوت"
 
-    # ۶. ویس
+    # ۴. ویس
     elif replied.voice:
-        identity_value = f"VOICE:{replied.voice.file_id}"
-        kind_label = "🎤 ویس"
+        file_id = replied.voice.file_id
+        caption = (replied.caption or "").strip()
+        identity_value = f"VOICE:{file_id}|CAPTION|{caption}" if caption else f"VOICE:{file_id}"
+        kind_label = "🎤 ویس" + (" + 💬 کپشن" if caption else "")
 
-    # ۷. فایل/سند
+    # ۵. فایل/سند
     elif replied.document:
-        identity_value = f"DOCUMENT:{replied.document.file_id}"
-        kind_label = "📎 فایل"
+        file_id = replied.document.file_id
+        caption = (replied.caption or "").strip()
+        identity_value = f"DOCUMENT:{file_id}|CAPTION|{caption}" if caption else f"DOCUMENT:{file_id}"
+        kind_label = "📎 فایل" + (" + 💬 کپشن" if caption else "")
 
-    # ۸. استیکر
+    # ۶. استیکر
     elif replied.sticker:
         identity_value = f"STICKER:{replied.sticker.file_id}"
         kind_label = "🎨 استیکر"
+
+    # ۷. فقط متن
+    elif replied.text:
+        identity_value = replied.text.strip()
+        kind_label = "📝 متن"
 
     if not identity_value:
         await message.reply_text(
@@ -997,7 +1000,7 @@ async def save_identity_smart(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     key = identity_key(chat.id, target.id)
-    data["identities"][key] = identity_value[:4000]  # سقف بالا برای کپشن‌های طولانی
+    data["identities"][key] = identity_value[:4000]
     save_data()
 
     preview = identity_value[:100]
@@ -1007,6 +1010,27 @@ async def save_identity_smart(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"نوع: {kind_label}\n\n"
         f"{preview}{'...' if len(identity_value) > 100 else ''}"
     )
+def _split_identity(identity: str):
+    """جدا کردن نوع، file_id و کپشن از رشته‌ی ذخیره‌شده"""
+    prefix = ""
+    file_id = ""
+    caption = ""
+
+    if ":" in identity and not identity.startswith("PHOTO:") is False:
+        pass
+
+    for p in ("PHOTO", "VIDEO", "VIDEO_NOTE", "VOICE", "DOCUMENT", "STICKER"):
+        if identity.startswith(f"{p}:"):
+            prefix = p
+            rest = identity[len(p) + 1:]
+            if "|CAPTION|" in rest:
+                file_id, caption = rest.split("|CAPTION|", 1)
+            else:
+                file_id = rest
+            return prefix, file_id, caption
+
+    return None, "", identity  # متن خالص
+
 
 async def show_identity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
@@ -1028,11 +1052,13 @@ async def show_identity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await reply_and_delete(update, "❓ برای این شخص هویتی ثبت نشده است.")
         return
 
-    # اگه رسانه ذخیره شده بود
-    if identity.startswith("PHOTO:"):
+    prefix, file_id, caption = _split_identity(identity)
+
+    # --- نمایش رسانه با کپشن ---
+    if prefix == "PHOTO":
         await message.reply_photo(
-            photo=identity.split(":", 1)[1],
-            caption=f"🆔 **هویت {target.first_name}** (🖼 عکس)",
+            photo=file_id,
+            caption=f"🆔 **هویت {target.first_name}**" + (f"\n\n{caption}" if caption else ""),
             parse_mode="Markdown",
         )
         try:
@@ -1041,10 +1067,10 @@ async def show_identity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             pass
         return
 
-    if identity.startswith("VIDEO:"):
+    if prefix == "VIDEO":
         await message.reply_video(
-            video=identity.split(":", 1)[1],
-            caption=f"🆔 **هویت {target.first_name}** (🎬 ویدیو)",
+            video=file_id,
+            caption=f"🆔 **هویت {target.first_name}**" + (f"\n\n{caption}" if caption else ""),
             parse_mode="Markdown",
         )
         try:
@@ -1053,14 +1079,10 @@ async def show_identity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             pass
         return
 
-    if identity.startswith("VIDEO_NOTE:"):
-        await message.reply_video_note(video_note=identity.split(":", 1)[1])
-        return
-
-    if identity.startswith("VOICE:"):
+    if prefix == "VOICE":
         await message.reply_voice(
-            voice=identity.split(":", 1)[1],
-            caption=f"🆔 **هویت {target.first_name}** (🎤 ویس)",
+            voice=file_id,
+            caption=f"🆔 **هویت {target.first_name}**" + (f"\n\n{caption}" if caption else ""),
             parse_mode="Markdown",
         )
         try:
@@ -1069,10 +1091,10 @@ async def show_identity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             pass
         return
 
-    if identity.startswith("DOCUMENT:"):
+    if prefix == "DOCUMENT":
         await message.reply_document(
-            document=identity.split(":", 1)[1],
-            caption=f"🆔 **هویت {target.first_name}** (📎 فایل)",
+            document=file_id,
+            caption=f"🆔 **هویت {target.first_name}**" + (f"\n\n{caption}" if caption else ""),
             parse_mode="Markdown",
         )
         try:
@@ -1081,13 +1103,16 @@ async def show_identity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             pass
         return
 
-    if identity.startswith("STICKER:"):
-        await message.reply_sticker(sticker=identity.split(":", 1)[1])
+    if prefix == "VIDEO_NOTE":
+        await message.reply_video_note(video_note=file_id)
         return
 
-    # متن یا کپشن
-    await reply_and_delete(update, f"🆔 **هویت {target.first_name}:**\n\n{identity}")
+    if prefix == "STICKER":
+        await message.reply_sticker(sticker=file_id)
+        return
 
+    # متن خالص
+    await reply_and_delete(update, f"🆔 **هویت {target.first_name}:**\n\n{identity}")
 # ==========================================
 # قفل گروه
 # ==========================================
