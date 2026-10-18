@@ -1,5 +1,6 @@
 import random
 import logging
+import re
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import json
@@ -36,7 +37,7 @@ TOKEN = "8243532879:AAGiI169Ra-rvkUHV3YRPuekwL_1Y3kmC4c"
 DATA_FILE = Path("bot_data.json")
 
 # ── کلید DeepSeek ──
-DEEPSEEK_API_KEY = "sk-fad7ab1e82014748bf2c42f1746d3cd6" 
+DEEPSEEK_API_KEY = "sk-fad7ab1e82014748bf2c42f1746d3cd6"
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -63,6 +64,8 @@ data = {
     "special": {}, "custom_lock_text": {}, "last_messages": {},
     "message_counts": {}, "join_dates": {},
     "chatter": {},
+    "banned": {},
+    "muted": {},
 }
 
 
@@ -134,19 +137,35 @@ async def reply_and_delete(update, text, reply_markup=None):
     try:
         await message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
     except TelegramError:
-        logger.exception("خطا در ارسال پاسخ")
-        return
+        try:
+            await message.reply_text(text, reply_markup=reply_markup)
+        except TelegramError:
+            logger.exception("خطا در ارسال پاسخ")
+            return
     try:
         await message.delete()
     except TelegramError:
         pass
 
 
+async def get_user_display(chat_id, user_id, context):
+    """گرفتن اسم نمایشی کاربر از تلگرام"""
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        user = member.user
+        name = user.first_name or "بدون نام"
+        if user.username:
+            return f"{name} (@{user.username})"
+        return name
+    except TelegramError:
+        return f"کاربر {user_id}"
+
+
 # ==========================================
 # قفل‌ها
 # ==========================================
 def default_locks():
-    return {"messages": False, "photo": False, "video": False, "link": False, "media": False, "quiet": False}
+    return {"messages": False, "photo": False, "video": False, "link": False, "media": False}
 
 
 def get_locks(chat_id):
@@ -161,7 +180,7 @@ def get_locks(chat_id):
 
 def make_permissions(chat_id):
     locks = get_locks(chat_id)
-    can_send = not (locks["messages"] or locks["quiet"])
+    can_send = not locks["messages"]
     return ChatPermissions(
         can_send_messages=can_send,
         can_send_audios=can_send and not locks["media"],
@@ -174,6 +193,115 @@ def make_permissions(chat_id):
         can_send_other_messages=can_send and not locks["media"],
         can_add_web_page_previews=can_send and not locks["link"],
     )
+
+
+# فقط لینک‌ها — mention و ایمیل رو نمی‌گیره
+URL_RE = re.compile(
+    r"(?:https?://|www\.|t\.me/|telegram\.me/|tg://)\S*",
+    re.IGNORECASE,
+)
+
+
+async def check_link_lock(update, context):
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not message or not chat or not user:
+        return
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    if not is_allowed_chat(chat.id):
+        return
+    if user.is_bot:
+        return
+
+    locks = get_locks(chat.id)
+    if not locks["link"]:
+        return
+
+    # ادمین‌ها معاف
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        if member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+            return
+    except TelegramError:
+        pass
+
+    has_link = False
+
+    all_entities = list(message.entities or []) + list(message.caption_entities or [])
+    for ent in all_entities:
+        if ent.type in ("url", "text_link"):
+            has_link = True
+            break
+
+    if not has_link:
+        text = message.text or message.caption or ""
+        if URL_RE.search(text):
+            has_link = True
+
+    if not has_link:
+        return
+
+    try:
+        await message.delete()
+    except TelegramError:
+        pass
+
+    ck = chat_key(chat.id)
+    uk = user_key(user.id)
+    data["warns"].setdefault(ck, {})
+    current = int(data["warns"][ck].get(uk, 0))
+    new_count = current + 1
+
+    if new_count == 1:
+        data["warns"][ck][uk] = 1
+        warn_text = (
+            "زهر اول: اولین قطره‌ی زهر وارد پرونده شد؛ دفعه‌ی بعد، عواقبش با خودته. 🥀\n\n"
+            "🚫 دلیل: ارسال لینک در گروه ممنوع است!"
+        )
+    elif new_count == 2:
+        data["warns"][ck][uk] = 2
+        warn_text = (
+            "🦂 زهر دوم: زهر دوم هم ثبت شد؛ فقط یک قدم تا حذف از این قلمرو فاصله داری. ☠️\n\n"
+            "🚫 دلیل: ارسال لینک در گروه ممنوع است!"
+        )
+    else:
+        try:
+            await context.bot.ban_chat_member(chat.id, user.id)
+            data["warns"][ck][uk] = 0
+            warn_text = (
+                "🦂 زهر سوم: سه قطره زهر، یک حکم قطعی! ⚖️\n"
+                "🚫 مهلتت تموم شد؛ از این قلمرو اخراج شدی.\n\n"
+                "🚫 دلیل: ارسال لینک در گروه ممنوع است!"
+            )
+            data["banned"].setdefault(ck, {})
+            data["banned"][ck][uk] = {
+                "reason": "ارسال لینک مکرر (زهر سوم)",
+                "date": datetime.now().strftime("%Y/%m/%d %H:%M"),
+            }
+        except TelegramError as e:
+            logger.exception(f"خطا در بن: {e}")
+            warn_text = "❌ خطا در اجرای حکم."
+
+    save_data()
+
+    final_count = int(data["warns"].get(ck, {}).get(uk, 0))
+    warn_display = f"⚠️ اخطار: {final_count} از ۳\n" if final_count > 0 else ""
+
+    full_text = (
+        f"{warn_text}\n\n"
+        f"{warn_display}"
+        f"👤 کاربر: {user.mention_html()}\n"
+        f"🆔 آیدی: <code>{user.id}</code>"
+    )
+
+    try:
+        await context.bot.send_message(chat.id, full_text, parse_mode="HTML")
+    except TelegramError as e:
+        logger.exception(f"خطا در ارسال هشدار: {e}")
+
+    raise ApplicationHandlerStop
 
 
 async def apply_locks(chat, context):
@@ -232,6 +360,7 @@ CHATTER_REPLIES = {
     ],
 }
 
+
 def _classify_text(text: str) -> str:
     t = text.casefold()
     if any(w in t for w in ("سلام", "درود", "hi", "hello", "hey", "صبح بخیر", "شب بخیر")):
@@ -250,12 +379,12 @@ def _classify_text(text: str) -> str:
         return "question"
     return "general"
 
+
 def _local_reply(user_text: str) -> str:
     cat = _classify_text(user_text)
     return random.choice(CHATTER_REPLIES.get(cat, CHATTER_REPLIES["general"]))
 
 
-# ─── فقط API دیپ‌سیک ───
 async def generate_chatter_reply(user_text: str, user_name: str) -> str:
     if not DEEPSEEK_API_KEY or "کلید_جدید" in DEEPSEEK_API_KEY:
         logger.warning("⚠️ کلید دیپ‌سیک تنظیم نشده است. استفاده از جواب‌های آماده.")
@@ -288,8 +417,7 @@ async def generate_chatter_reply(user_text: str, user_name: str) -> str:
                 logger.warning(f"DeepSeek HTTP {r.status_code}: {r.text[:150]}")
     except Exception as e:
         logger.warning(f"DeepSeek استثنا: {e}")
-    
-    # اگه خطا داد
+
     logger.info("⚠️ خطا در DeepSeek → جواب آماده")
     return _local_reply(user_text)
 
@@ -349,21 +477,14 @@ def lock_keyboard(chat_id):
 
 
 def settings_keyboard(chat_id):
-    locks = get_locks(chat_id)
-    quiet_btn = InlineKeyboardButton(
-        "🟢 درگوشی فعال — خاموش کردن" if locks["quiet"] else "🔴 درگوشی غیرفعال — فعال کردن",
-        callback_data="quiet_off" if locks["quiet"] else "quiet_on",
-    )
     chatter_btn = InlineKeyboardButton(
         "🟢 سخنگو فعال — خاموش کردن" if is_chatter_on(chat_id) else "🔴 سخنگو غیرفعال — فعال کردن",
         callback_data="chatter_off" if is_chatter_on(chat_id) else "chatter_on",
     )
     return InlineKeyboardMarkup([
-        [quiet_btn],
         [chatter_btn],
         [InlineKeyboardButton("✏️ تغییر متن قفل گروه", callback_data="set_lock_text")],
         [InlineKeyboardButton("🚫 فیلتر کلمات", callback_data="menu_filters")],
-        [InlineKeyboardButton("💎 راهنمای ویژه", callback_data="special_info")],
         [InlineKeyboardButton("🔙 برگشت به پنل", callback_data="back_main")],
     ])
 
@@ -377,6 +498,9 @@ def members_keyboard():
         [InlineKeyboardButton("☠️ زهر (اخطار)", callback_data="m_warn"),
          InlineKeyboardButton("🧪 پادزهر (رفع اخطار)", callback_data="m_unwarn")],
         [InlineKeyboardButton("📋 پروفایل کاربر", callback_data="m_profile")],
+        [InlineKeyboardButton("📊 لیست بن‌شده‌ها", callback_data="list_banned")],
+        [InlineKeyboardButton("🔇 لیست سکوت‌شده‌ها", callback_data="list_muted")],
+        [InlineKeyboardButton("☠️ لیست زهرخورده‌ها", callback_data="list_warned")],
         [InlineKeyboardButton("🔙 برگشت به پنل", callback_data="back_main")],
     ])
 
@@ -474,7 +598,7 @@ async def help_command(update, context):
         "درتوبزار — سکوت (دائمی یا با عدد)\nدرتوبردار — رفع سکوت\n"
         "/zahr — ثبت اخطار\n/padezahr — پاک‌کردن اخطارها\n/vijeh — عضو ویژه\n/profile — پروفایل\n\n"
         "ابزارها:\n/filter کلمه — افزودن فیلتر\n/unfilter کلمه — حذف فیلتر\n/filters — نمایش فیلترها\n"
-        "/hovie — ثبت هویت هوشمند\n/haft — فعال‌کردن درگوشی\n/haftoff — خاموش‌کردن درگوشی\n"
+        "/hovie — ثبت هویت هوشمند\n"
         "/fal — فال حافظ\n/date — تاریخ شمسی\n/panel — پنل مدیریت\n"
         "/tagall — تگ همه\n/tagadmins — تگ ادمین‌ها\n/tagactive — تگ ۲۰ کاربر فعال\n"
         "/anon متن — پیام ناشناس\n\n"
@@ -501,35 +625,6 @@ async def get_target(update):
 # ==========================================
 # مدیریت اعضا
 # ==========================================
-async def apply_zahr(chat, target_user, context) -> str:
-    ck = chat_key(chat.id)
-    uk = user_key(target_user.id)
-
-    data["warns"].setdefault(ck, {})
-    current = int(data["warns"][ck].get(uk, 0))
-    new_count = current + 1
-
-    if new_count == 1:
-        data["warns"][ck][uk] = 1
-        save_data()
-        return "زهر اول: اولین قطره‌ی زهر وارد پرونده شد؛ دفعه‌ی بعد، عواقبش با خودته. 🥀"
-
-    if new_count == 2:
-        data["warns"][ck][uk] = 2
-        save_data()
-        return "🦂 زهر دوم: زهر دوم هم ثبت شد؛ فقط یک قدم تا حذف از این قلمرو فاصله داری. ☠️"
-
-    try:
-        await context.bot.ban_chat_member(chat.id, target_user.id)
-        data["warns"][ck][uk] = 0
-        save_data()
-        return (
-            "🦂 زهر سوم: سه قطره زهر، یک حکم قطعی! ⚖️\n"
-            "🚫 مهلتت تموم شد؛ از این قلمرو اخراج شدی."
-        )
-    except TelegramError as e:
-        logger.exception(f"خطا در بن: {e}")
-        return "❌ خطا در اجرای حکم. احتمالاً ربات دسترسی کافی ندارد."
 async def member_action(update, context, action):
     if not await require_admin(update, context):
         return
@@ -561,6 +656,17 @@ async def member_action(update, context, action):
                 pass
 
             await context.bot.ban_chat_member(chat.id, target.id)
+
+            if action == "ban":
+                ck_ban = chat_key(chat.id)
+                uk_ban = user_key(target.id)
+                data["banned"].setdefault(ck_ban, {})
+                data["banned"][ck_ban][uk_ban] = {
+                    "reason": "بن دستی توسط ادمین",
+                    "date": datetime.now().strftime("%Y/%m/%d %H:%M"),
+                }
+                save_data()
+
             if action == "kick":
                 await context.bot.unban_chat_member(chat.id, target.id, only_if_banned=True)
                 answer = (
@@ -583,6 +689,15 @@ async def member_action(update, context, action):
 
         elif action == "unban":
             await context.bot.unban_chat_member(chat.id, target.id, only_if_banned=True)
+
+            ck_ban = chat_key(chat.id)
+            uk_ban = user_key(target.id)
+            if ck_ban in data["banned"] and uk_ban in data["banned"][ck_ban]:
+                del data["banned"][ck_ban][uk_ban]
+                if not data["banned"][ck_ban]:
+                    del data["banned"][ck_ban]
+                save_data()
+
             answer = (
                 "ظاهراً جهنم هم دیگه ظرفیتت رو نداشت. برگرد به قلمرو؛ فعلاً تحملت می‌کنیم. 🥀\n\n"
                 f"👤 کاربر: {target.mention_html()}\n"
@@ -630,6 +745,15 @@ async def member_action(update, context, action):
                 use_independent_chat_permissions=True,
             )
 
+            ck_mute = chat_key(chat.id)
+            uk_mute = user_key(target.id)
+            data["muted"].setdefault(ck_mute, {})
+            data["muted"][ck_mute][uk_mute] = {
+                "duration": f"{minutes} دقیقه" if minutes else "دائمی",
+                "date": datetime.now().strftime("%Y/%m/%d %H:%M"),
+            }
+            save_data()
+
             duration_text = f"{minutes} دقیقه" if minutes else "دائمی"
 
             answer = (
@@ -656,6 +780,15 @@ async def member_action(update, context, action):
                 ),
                 use_independent_chat_permissions=True,
             )
+
+            ck_mute = chat_key(chat.id)
+            uk_mute = user_key(target.id)
+            if ck_mute in data["muted"] and uk_mute in data["muted"][ck_mute]:
+                del data["muted"][ck_mute][uk_mute]
+                if not data["muted"][ck_mute]:
+                    del data["muted"][ck_mute]
+                save_data()
+
             answer = (
                 f"سکوتش به پایان رسید، خدا به دادمون برسه 🤯\n\n"
                 f"👤 کاربر: {target.mention_html()}\n"
@@ -694,10 +827,14 @@ async def member_action(update, context, action):
                     await context.bot.ban_chat_member(chat.id, target.id)
                     data["warns"][ck][uk] = 0
                     answer = "🦂 زهر سوم: سه قطره زهر، یک حکم قطعی! ⚖️\n🚫 مهلتت تموم شد؛ از این قلمرو اخراج شدی."
+                    data["banned"].setdefault(ck, {})
+                    data["banned"][ck][uk] = {
+                        "reason": "زهر سوم (دستی)",
+                        "date": datetime.now().strftime("%Y/%m/%d %H:%M"),
+                    }
                 except TelegramError as e:
                     logger.exception(f"خطا در بن: {e}")
                     answer = "❌ خطا در اجرای حکم."
-                save_data()
 
             save_data()
 
@@ -1068,6 +1205,7 @@ async def save_identity_smart(update, context):
         f"نوع: {kind_label}",
     )
 
+
 def _split_identity(identity):
     for p in ("PHOTO", "VIDEO", "VIDEO_NOTE", "VOICE", "DOCUMENT", "STICKER"):
         if identity.startswith(f"{p}:"):
@@ -1154,6 +1292,8 @@ async def delete_identity(update, context):
         update,
         f"🗑 هویت {target.first_name} حذف شد.{username_line}",
     )
+
+
 # ==========================================
 # قفل گروه
 # ==========================================
@@ -1320,19 +1460,30 @@ async def add_filter(update, context):
         return
     if not await require_admin(update, context):
         return
-    parts = message.text.split(maxsplit=1) if message.text else []
-    if len(parts) < 2 or not parts[1].strip():
-        await message.reply_text("استفاده: /filter کلمه")
+
+    text = message.text or ""
+    if text.startswith("/filter"):
+        parts = text.split(maxsplit=1)
+    elif text.startswith("فیلتر"):
+        parts = text.split(maxsplit=1)
+    else:
         return
+
+    if len(parts) < 2 or not parts[1].strip():
+        await message.reply_text("استفاده: `/filter کلمه` یا `فیلتر کلمه`")
+        return
+
     word = parts[1].strip().casefold()
     chat_id = str(chat.id)
     data["filters"].setdefault(chat_id, [])
+
     if word in data["filters"][chat_id]:
-        await message.reply_text("این عبارت از قبل فیلتر شده است.")
+        await message.reply_text(f"⚠️ عبارت «{word}» از قبل فیلتر شده است.")
         return
+
     data["filters"][chat_id].append(word)
     save_data()
-    await message.reply_text(f"✅ عبارت «{word}» به فیلتر اضافه شد.")
+    await message.reply_text(f"✅ عبارت «{word}» به لیست فیلترها اضافه شد.\n\n📊 تعداد فیلترها: {len(data['filters'][chat_id])}")
 
 
 async def remove_filter(update, context):
@@ -1342,19 +1493,37 @@ async def remove_filter(update, context):
         return
     if not await require_admin(update, context):
         return
-    parts = message.text.split(maxsplit=1) if message.text else []
-    if len(parts) < 2 or not parts[1].strip():
-        await message.reply_text("استفاده: /unfilter کلمه")
+
+    text = message.text or ""
+    if text.startswith("/unfilter"):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await message.reply_text("استفاده: `/unfilter کلمه`")
+            return
+        word = parts[1].strip().casefold()
+    elif text.startswith("حذف فیلتر"):
+        parts = text.split(maxsplit=2)
+        if len(parts) < 3 or not parts[2].strip():
+            await message.reply_text("استفاده: `حذف فیلتر کلمه`")
+            return
+        word = parts[2].strip().casefold()
+    else:
         return
-    word = parts[1].strip().casefold()
+
     chat_id = str(chat.id)
     words = data["filters"].setdefault(chat_id, [])
+
     if word not in words:
-        await message.reply_text("این عبارت در فهرست فیلترها نیست.")
+        await message.reply_text(f"❌ عبارت «{word}» در لیست فیلترها نیست.")
         return
+
     words.remove(word)
     save_data()
-    await message.reply_text(f"✅ عبارت «{word}» از فیلتر حذف شد.")
+
+    await message.reply_text(
+        f"✅ عبارت «{word}» از لیست فیلترها حذف شد.\n\n"
+        f"📊 تعداد فیلترها: {len(words)}"
+    )
 
 
 async def list_filters(update, context):
@@ -1383,9 +1552,12 @@ async def check_filter(update, context):
         return
     if user.is_bot:
         return
-    if not message.text:
+
+    text_content = message.text or message.caption
+    if not text_content:
         return
-    if message.text.startswith(("/anon", "ناشناس", "پیام مخفی", "/", "تگ")):
+
+    if text_content.startswith(("/anon", "ناشناس", "پیام مخفی", "/", "تگ", "فیلتر", "حذف فیلتر", "فیلترها")):
         return
 
     try:
@@ -1393,76 +1565,169 @@ async def check_filter(update, context):
         if member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
             return
     except TelegramError:
+        pass
+
+    chat_id = str(chat.id)
+    filters = data["filters"].get(chat_id, [])
+    if not filters:
         return
 
-    text_to_check = message.text.casefold()
-    for word in data["filters"].get(str(chat.id), []):
-        if word and word in text_to_check:
+    text_lower = text_content.casefold()
+    for word in filters:
+        if not word:
+            continue
+        pattern = r'(?<![^\W\d_])' + re.escape(word) + r'(?![^\W\d_])'
+        if re.search(pattern, text_lower, re.IGNORECASE):
             try:
                 await message.delete()
             except TelegramError:
                 pass
             return
 
-    ck = chat_key(chat.id)
-    uk = user_key(user.id)
 
-    data.setdefault("last_messages", {})
-    last_msg = data["last_messages"].get(f"{ck}:{uk}")
+# ==========================================
+# لیست‌های مدیریتی
+# ==========================================
+async def show_banned_list(update, context):
+    query = update.callback_query
+    if not query or not query.message:
+        return
+    chat = query.message.chat
 
-    if last_msg and last_msg.lower() == message.text.lower():
-        data["warns"].setdefault(ck, {})
-        current = int(data["warns"][ck].get(uk, 0))
-        new_count = current + 1
+    try:
+        member = await context.bot.get_chat_member(chat.id, query.from_user.id)
+        if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+            await query.answer("⛔ فقط مدیر گروه اجازه دارد.", show_alert=True)
+            return
+    except TelegramError:
+        return
 
-        if new_count == 1:
-            data["warns"][ck][uk] = 1
-            warn_text = (
-                "زهر اول: اولین قطره‌ی زهر وارد پرونده شد؛ دفعه‌ی بعد، عواقبش با خودته. 🥀\n\n"
-                f"⚠️ اخطار: 1 از ۳\n"
-                f"👤 کاربر: {user.mention_html()}\n"
-                f"🆔 آیدی: <code>{user.id}</code>"
-            )
-        elif new_count == 2:
-            data["warns"][ck][uk] = 2
-            warn_text = (
-                "🦂 زهر دوم: زهر دوم هم ثبت شد؛ فقط یک قدم تا حذف از این قلمرو فاصله داری. ☠️\n\n"
-                f"⚠️ اخطار: 2 از ۳\n"
-                f"👤 کاربر: {user.mention_html()}\n"
-                f"🆔 آیدی: <code>{user.id}</code>"
-            )
-        else:
-            try:
-                await context.bot.ban_chat_member(chat.id, user.id)
-                data["warns"][ck][uk] = 0
-                warn_text = (
-                    "🦂 زهر سوم: سه قطره زهر، یک حکم قطعی! ⚖️\n"
-                    "🚫 مهلتت تموم شد؛ از این قلمرو اخراج شدی.\n\n"
-                    f"👤 کاربر: {user.mention_html()}\n"
-                    f"🆔 آیدی: <code>{user.id}</code>"
-                )
-            except TelegramError as e:
-                logger.exception(f"خطا در بن: {e}")
-                warn_text = f"❌ خطا در اجرای حکم: {e}"
+    chat_id = str(chat.id)
+    banned = data["banned"].get(chat_id, {})
 
-        try:
-            await message.delete()
-        except TelegramError:
-            pass
+    text = "📊 **لیست افراد بن‌شده**\n\n"
 
-        try:
-            await message.reply_text(warn_text, parse_mode="HTML")
-        except TelegramError:
-            try:
-                await context.bot.send_message(chat.id, warn_text, parse_mode="HTML")
-            except TelegramError as e:
-                logger.exception(f"خطا در ارسال هشدار: {e}")
-
-        save_data()
-        data["last_messages"][f"{ck}:{uk}"] = None
+    if not banned:
+        text += "هیچ کاربری بن نشده است. ✅"
     else:
-        data["last_messages"][f"{ck}:{uk}"] = message.text
-        save_data()
+        items = []
+        for uid, info in banned.items():
+            name = await get_user_display(chat.id, int(uid), context)
+            reason = info.get("reason", "نامشخص")
+            date = info.get("date", "نامشخص")
+            items.append(f"• {name}\n  🆔 `{uid}` | 📅 {date}\n  📝 {reason}")
+        text += "\n\n".join(items)
+        text += f"\n\n📊 تعداد: {len(banned)}"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 برگشت", callback_data="menu_members")]
+    ])
+
+    try:
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    except TelegramError:
+        pass
+
+
+async def show_muted_list(update, context):
+    query = update.callback_query
+    if not query or not query.message:
+        return
+    chat = query.message.chat
+
+    try:
+        member = await context.bot.get_chat_member(chat.id, query.from_user.id)
+        if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+            await query.answer("⛔ فقط مدیر گروه اجازه دارد.", show_alert=True)
+            return
+    except TelegramError:
+        return
+
+    chat_id = str(chat.id)
+    muted = data["muted"].get(chat_id, {})
+
+    text = "🔇 **لیست افراد سکوت‌شده**\n\n"
+
+    if not muted:
+        text += "هیچ کاربری سکوت نشده است. ✅"
+    else:
+        items = []
+        for uid, info in muted.items():
+            name = await get_user_display(chat.id, int(uid), context)
+            duration = info.get("duration", "نامشخص")
+            date = info.get("date", "نامشخص")
+            items.append(f"• {name}\n  🆔 `{uid}` | 📅 {date}\n  ⏱ مدت: {duration}")
+        text += "\n\n".join(items)
+        text += f"\n\n📊 تعداد: {len(muted)}"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 برگشت", callback_data="menu_members")]
+    ])
+
+    try:
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    except TelegramError:
+        pass
+
+
+async def show_warned_list(update, context):
+    query = update.callback_query
+    if not query or not query.message:
+        return
+    chat = query.message.chat
+
+    try:
+        member = await context.bot.get_chat_member(chat.id, query.from_user.id)
+        if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+            await query.answer("⛔ فقط مدیر گروه اجازه دارد.", show_alert=True)
+            return
+    except TelegramError:
+        return
+
+    chat_id = str(chat.id)
+    warns = data["warns"].get(chat_id, {})
+
+    active_warns = {}
+    for uid, count in warns.items():
+        try:
+            c = int(count)
+        except (ValueError, TypeError):
+            continue
+        if c > 0:
+            active_warns[uid] = c
+
+    text = "☠️ **لیست افراد دارای زهر**\n\n"
+
+    if not active_warns:
+        text += "هیچ کاربری زهر ندارد. ✅"
+    else:
+        items = []
+        for uid, count in active_warns.items():
+            try:
+                member_info = await context.bot.get_chat_member(chat.id, int(uid))
+                user = member_info.user
+                name = user.first_name or "بدون نام"
+                username = f"@{user.username}" if user.username else "ندارد"
+            except TelegramError:
+                name = "کاربر ناشناس"
+                username = "ندارد"
+
+            items.append(
+                f"• **{name}** \n"
+                f"  username :  ({username}) | ⚠️ {count} از ۳"
+            )
+
+        text += "\n\n\n".join(items)
+        text += f"\n\n\n📊 تعداد: {len(active_warns)}"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 برگشت", callback_data="menu_members")]
+    ])
+
+    try:
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    except TelegramError:
+        pass
 
 
 # ==========================================
@@ -1546,9 +1811,7 @@ async def callback_handler(update, context):
                 "`قفل گروه [متن دلخواه]`\n"
                 "`باز کردن گروه`\n"
                 "`کرکره پایین` — قفل گروه\n"
-                "`گشایش` — باز کردن گروه\n"
-                "`درگوشی`\n"
-                "`درگوشی خاموش`"
+                "`گشایش` — باز کردن گروه"
             )
             await query.edit_message_text(text, reply_markup=lock_keyboard(chat.id))
             return
@@ -1643,8 +1906,6 @@ async def callback_handler(update, context):
                 "`/hovie` یا `ثبت هویت` — ثبت/آپدیت هویت\n"
                 "`هویت` — نمایش هویت\n"
                 "`حذف هویت` — پاک کردن هویت\n"
-                "`/haft` یا `درگوشی` — سکوت گروه\n"
-                "`/haftoff` یا `درگوشی خاموش` — رفع سکوت\n"
                 "`/date` یا `تاریخ` — تاریخ شمسی\n"
                 "`/fal` یا `فال` — فال حافظ\n"
                 "`/tagall` یا `تگ` — تگ همه\n"
@@ -1664,6 +1925,18 @@ async def callback_handler(update, context):
         if action == "menu_status":
             await query.edit_message_text(await status_text(chat.id, context),
                                           reply_markup=main_keyboard(chat.id))
+            return
+
+        if action == "list_banned":
+            await show_banned_list(update, context)
+            return
+
+        if action == "list_muted":
+            await show_muted_list(update, context)
+            return
+
+        if action == "list_warned":
+            await show_warned_list(update, context)
             return
 
         if action.startswith("m_"):
@@ -1688,7 +1961,6 @@ async def callback_handler(update, context):
                 await query.answer("روی پیام شخص ریپلای کن و بنویس: حذف هویت", show_alert=True)
             return
 
-        # ── سخنگو ──
         if action == "chatter_on":
             set_chatter(chat.id, True)
             await query.answer("🗣 سخنگو فعال شد. حالا روی پیام ربات ریپلای کن تا جواب بده.")
@@ -1709,17 +1981,7 @@ async def callback_handler(update, context):
 
         locks = get_locks(chat.id)
 
-        if action == "quiet_on":
-            locks["quiet"] = True
-            save_data()
-            await apply_locks(chat, context)
-            await query.answer("حالت سکوت فعال شد.")
-        elif action == "quiet_off":
-            locks["quiet"] = False
-            save_data()
-            await apply_locks(chat, context)
-            await query.answer("حالت سکوت غیرفعال شد.")
-        elif action == "toggle_photo":
+        if action == "toggle_photo":
             locks["photo"] = not locks.get("photo", False)
             save_data()
             await apply_locks(chat, context)
@@ -1774,18 +2036,15 @@ async def callback_handler(update, context):
         elif action == "set_lock_text":
             await query.answer("برای تغییر متن قفل گروه، تایپ کن: تنظیم متن قفل گروه [متن دلخواه]", show_alert=True)
             return
-        elif action == "special_info":
-            await query.answer("برای محدودکردن رسانه‌های یک عضو، روی پیامش ریپلای کن و /vijeh بزن.", show_alert=True)
-            return
         else:
             await query.answer("این گزینه شناخته نشد.")
             return
 
-        if action.startswith("toggle_") or action in ("quiet_on", "quiet_off", "lock_group", "unlock_group"):
-            try:
+        try:
+            if action.startswith("toggle_") or action in ("lock_group", "unlock_group"):
                 await query.edit_message_reply_markup(reply_markup=lock_keyboard(chat.id))
-            except TelegramError:
-                pass
+        except TelegramError:
+            pass
 
     except TelegramError as exc:
         logger.exception("خطا در پنل")
@@ -1796,33 +2055,8 @@ async def callback_handler(update, context):
 
 
 # ==========================================
-# درگوشی، تاریخ، فال
+# تاریخ، فال
 # ==========================================
-async def set_quiet(update, context, enabled):
-    chat = update.effective_chat
-    message = update.effective_message
-    if not chat or not message:
-        return
-    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        await message.reply_text("این دستور فقط در گروه قابل استفاده است.")
-        return
-    if not await require_admin(update, context):
-        return
-    locks = get_locks(chat.id)
-    locks["quiet"] = enabled
-    save_data()
-    await apply_locks(chat, context)
-    await message.reply_text("🔇 حالت سکوت گروه فعال شد." if enabled else "🔊 حالت سکوت گروه غیرفعال شد.")
-
-
-async def quiet_on(update, context):
-    await set_quiet(update, context, True)
-
-
-async def quiet_off(update, context):
-    await set_quiet(update, context, False)
-
-
 async def date_command(update, context):
     message = update.effective_message
     if not message:
@@ -1851,8 +2085,6 @@ async def date_command(update, context):
 
 
 async def fal_command(update, context):
-    if not await require_admin(update, context):
-        return
     message = update.effective_message
     if not message:
         return
@@ -1887,16 +2119,14 @@ async def say_janam(update, context):
     if not user or not chat:
         return
 
-    # چک ادمین بودن
     try:
         member = await context.bot.get_chat_member(chat.id, user.id)
         if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
-            return  # اگه ادمین نبود، هیچی نمی‌گه
+            return
     except TelegramError:
         return
 
     await update.message.reply_text(f"جانم {user.first_name}؟ 💜")
-
 
 
 async def plain_mute_user(update, context):
@@ -2218,9 +2448,12 @@ def main() -> None:
     app = Application.builder().token(TOKEN_STR).build()
 
     # ۰. بلاک گروه غیرمجاز
-    app.add_handler(MessageHandler(filters.ALL, block_unauthorized), group=-1)
+    app.add_handler(MessageHandler(filters.ALL, block_unauthorized), group=-2)
 
-    # ۱. دستورات اسلش
+    # ۱. فیلتر کلمات — اول از همه
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_filter), group=-1)
+
+    # ۲. دستورات اسلش
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("panel", panel_command))
     app.add_handler(CommandHandler("help", help_command))
@@ -2236,43 +2469,42 @@ def main() -> None:
     app.add_handler(CommandHandler("filter", add_filter))
     app.add_handler(CommandHandler("unfilter", remove_filter))
     app.add_handler(CommandHandler("filters", list_filters))
-    app.add_handler(CommandHandler("haft", quiet_on))
-    app.add_handler(CommandHandler("haftoff", quiet_off))
     app.add_handler(CommandHandler("date", date_command))
+    app.add_handler(CommandHandler("fal", fal_command))
     app.add_handler(CommandHandler("hovie", save_identity_smart))
     app.add_handler(CommandHandler("anon", anon_command))
     app.add_handler(CommandHandler("tagall", tag_all))
     app.add_handler(CommandHandler("tagadmins", tag_admins))
     app.add_handler(CommandHandler("tagactive", tag_active))
 
-    # ۲. دکمه‌های شیشه‌ای
+    # ۳. دکمه‌های شیشه‌ای
     app.add_handler(CallbackQueryHandler(callback_handler))
 
-    # ۳. پیام ناشناس (قبل از فیلتر)
+    # ۴. پیام ناشناس
     app.add_handler(MessageHandler(filters.Regex(r"^/anon\s+.*$"), anon_command), group=0)
     app.add_handler(MessageHandler(filters.Regex(r"^ناشناس\s+.*$"), anon_command), group=0)
     app.add_handler(MessageHandler(filters.Regex(r"^پیام مخفی\s+.*$"), anon_command), group=0)
 
-    # ۴. شمارش پیام
+    # ۵. قفل لینک
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, check_link_lock), group=0)
+
+    # ۶. شمارش پیام
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, count_messages), group=0)
 
-    # ۵. خوش‌آمد
+    # ۷. خوش‌آمد
     app.add_handler(ChatMemberHandler(welcome_new_members, ChatMemberHandler.CHAT_MEMBER))
 
-    # ۵.۵ سخنگو — گروه ۲
-    app.add_handler(
-        MessageHandler(filters.REPLY & ~filters.COMMAND, chatter_reply),
-        group=2,
-    )
+    # ۸. سخنگو
+    app.add_handler(MessageHandler(filters.REPLY & ~filters.COMMAND, chatter_reply), group=2)
 
-    # ۶. فیلتر
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_filter), group=0)
-
-    # ۷. دستورات فارسی
+    # ۹. دستورات فارسی
     app.add_handler(MessageHandler(filters.Regex(r"^تگ$"), tag_all), group=1)
     app.add_handler(MessageHandler(filters.Regex(r"^تگ\s+.*$"), tag_all), group=1)
     app.add_handler(MessageHandler(filters.Regex(r"^تگ ادمین$"), tag_admins), group=1)
     app.add_handler(MessageHandler(filters.Regex(r"^تگ فعال$"), tag_active), group=1)
+    app.add_handler(MessageHandler(filters.Regex(r"^فیلتر\s+.*$"), add_filter), group=1)
+    app.add_handler(MessageHandler(filters.Regex(r"^حذف فیلتر\s+.*$"), remove_filter), group=1)
+    app.add_handler(MessageHandler(filters.Regex(r"^فیلترها$"), list_filters), group=1)
     app.add_handler(MessageHandler(filters.Regex(r"^پنل$"), panel_command), group=1)
     app.add_handler(MessageHandler(filters.Regex(r"^سیک$"), kick_user), group=1)
     app.add_handler(MessageHandler(filters.Regex(r"^بن$"), ban_user), group=1)
@@ -2291,8 +2523,6 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.Regex(r"^قفل گروه(?:\s+.*)?$"), lock_group_custom), group=1)
     app.add_handler(MessageHandler(filters.Regex(r"^باز کردن گروه$"), unlock_group_custom), group=1)
     app.add_handler(MessageHandler(filters.Regex(r"^تنظیم متن قفل گروه(\s+.*)?$"), set_custom_lock_text), group=1)
-    app.add_handler(MessageHandler(filters.Regex(r"^درگوشی$"), quiet_on), group=1)
-    app.add_handler(MessageHandler(filters.Regex(r"^درگوشی خاموش$"), quiet_off), group=1)
     app.add_handler(
         MessageHandler(
             filters.Regex(r"^(?:تاتی|تاتی من|تاتی دخترم|دخترم|تاتی عشقم|تاتی خوشگله|خوشگل من|تاتی خوشگل من)$"),
@@ -2301,19 +2531,13 @@ def main() -> None:
         group=1
     )
 
-    # ۸. دکمه‌های کیبورد پایین
+    # ۱۰. دکمه‌های کیبورد پایین
     app.add_handler(MessageHandler(filters.Regex(r"^🔒 کرکره پایین$"), karkare_paeen), group=1)
     app.add_handler(MessageHandler(filters.Regex(r"^کرکره پایین$"), karkare_paeen), group=1)
     app.add_handler(MessageHandler(filters.Regex(r"^🔓 گشایش$"), goshaiesh), group=1)
     app.add_handler(MessageHandler(filters.Regex(r"^گشایش$"), goshaiesh), group=1)
     app.add_handler(MessageHandler(filters.Regex(r"^👤 پروفایل من$"), profile_user), group=1)
-    app.add_handler(
-        MessageHandler(
-            filters.Regex(r"^📊 وضعیت گروه$"),
-            lambda u, c: c.bot.send_message(u.effective_chat.id, "برای دیدن وضعیت از پنل استفاده کنید."),
-        ),
-        group=1,
-    )
+    app.add_handler(MessageHandler(filters.Regex(r"^📊 وضعیت گروه$"), status_command), group=1)
     app.add_handler(MessageHandler(filters.Regex(r"^📖 راهنما$"), help_command), group=1)
     app.add_handler(MessageHandler(filters.Regex(r"^❌ بستن کیبورد$"), hide_bottom_keyboard), group=1)
 
@@ -2321,6 +2545,15 @@ def main() -> None:
 
     logger.info("ربات در حال اجراست...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+async def status_command(update, context):
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat:
+        return
+    text = await status_text(chat.id, context)
+    await message.reply_text(text)
 
 
 if __name__ == "__main__":
