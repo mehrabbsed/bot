@@ -2369,6 +2369,58 @@ async def tag_active(update, context):
 # ==========================================
 import asyncio  # ← این رو بالای فایل اضافه کن (اگه نیست)
 
+# ==========================================
+# پیام ناشناس
+# ==========================================
+import asyncio
+
+# ── ⚠️ اینجا آیدی عددی خودت رو بذار ──
+MY_USER_ID = 5695691254  # ← آیدی عددی تلگرام خودت رو جایگزین کن
+
+
+# ==========================================
+# پیام ناشناس
+# ==========================================
+import asyncio
+
+# ── ⚠️ اینجا آیدی عددی خودت رو بذار ──
+MY_USER_ID = 123456789  # ← آیدی عددی تلگرام خودت رو جایگزین کن
+
+
+# ==========================================
+
+# ==========================================
+# پیام ناشناس
+# ==========================================
+# ==========================================
+# پیام ناشناس (سریع‌ترین نسخه ممکن)
+# ==========================================
+import asyncio
+import time
+
+# ── ⚠️ آیدی عددی خودت ──
+MY_USER_ID = 5695691254
+
+# ── کش لیست ادمین‌ها ──
+_admin_cache = {}
+_ADMIN_CACHE_TTL = 600  # ۱۰ دقیقه
+
+
+async def get_cached_admin_ids(chat_id, context):
+    now = time.time()
+    cached = _admin_cache.get(chat_id)
+    if cached and (now - cached[1]) < _ADMIN_CACHE_TTL:
+        return cached[0]
+    try:
+        admins = await context.bot.get_chat_administrators(chat_id)
+        admin_ids = [a.user.id for a in admins if not a.user.is_bot]
+        _admin_cache[chat_id] = (admin_ids, now)
+        return admin_ids
+    except TelegramError as e:
+        logger.error(f"❌ خطا در گرفتن ادمین‌ها: {e}")
+        return cached[0] if cached else []
+
+
 async def anon_command(update, context):
     message = update.effective_message
     chat = update.effective_chat
@@ -2411,38 +2463,8 @@ async def anon_command(update, context):
     if message.reply_to_message:
         reply_to_msg_id = message.reply_to_message.message_id
 
-    # ── ۱. فوری پیام کاربر رو پاک کن (بدون معطلی) ──
-    try:
-        await message.delete()
-    except TelegramError:
-        pass
-
-    # ── ۲. هم‌زمان: پیام گروه + گرفتن ادمین‌ها رو موازی بفرست ──
+    # ── متن‌ها ──
     group_text = f"🕵️ **کاربر ناشناس**\n\n{anon_text}"
-
-    async def send_to_group():
-        try:
-            if reply_to_msg_id:
-                await context.bot.send_message(
-                    chat_id=chat.id, text=group_text, parse_mode="Markdown",
-                    reply_to_message_id=reply_to_msg_id,
-                )
-            else:
-                await context.bot.send_message(chat_id=chat.id, text=group_text, parse_mode="Markdown")
-        except TelegramError as e:
-            logger.exception(f"خطا در ارسال پیام ناشناس: {e}")
-
-    async def get_admins():
-        try:
-            return await context.bot.get_chat_administrators(chat.id)
-        except TelegramError as e:
-            logger.error(f"❌ خطا در گرفتن ادمین‌ها: {e}")
-            return []
-
-    # اجرای موازی: پیام گروه + گرفتن ادمین‌ها
-    _, admins = await asyncio.gather(send_to_group(), get_admins())
-
-    # ── ۳. پیام به همه‌ی ادمین‌ها رو موازی بفرست ──
     admin_text = (
         f"🕵️ **پیام ناشناس جدید**\n\n"
         f"👥 **گروه:** {chat.title}\n"
@@ -2453,29 +2475,61 @@ async def anon_command(update, context):
         f"💬 **متن پیام:**\n{anon_text}"
     )
 
-    async def send_to_admin(admin):
-        if admin.user.is_bot or admin.user.id == user.id:
-            return 0
+    # ── گرفتن لیست ادمین‌ها (از کش) ──
+    admin_ids = await get_cached_admin_ids(chat.id, context)
+    targets = [uid for uid in admin_ids if uid != user.id and uid != MY_USER_ID]
+
+    # ── تسک‌های پس‌زمینه ──
+    bg_tasks = []
+
+    # ۱. پاک کردن پیام کاربر
+    async def delete_user_msg():
         try:
-            await context.bot.send_message(chat_id=admin.user.id, text=admin_text, parse_mode="HTML")
-            return 1
+            await message.delete()
         except TelegramError:
-            return 0
+            pass
+    bg_tasks.append(asyncio.create_task(delete_user_msg()))
 
-    results = await asyncio.gather(*[send_to_admin(a) for a in admins], return_exceptions=True)
-    sent_to_admins = sum(r for r in results if isinstance(r, int))
+    # ۲. کپی به خودت
+    if MY_USER_ID and MY_USER_ID != user.id:
+        bg_tasks.append(asyncio.create_task(
+            context.bot.send_message(
+                chat_id=MY_USER_ID,
+                text="🔔 **[کپی شخصی]**\n\n" + admin_text,
+                parse_mode="HTML",
+            )
+        ))
 
-    # ── ۴. لاگ (بدون await، فوری) ──
+    # ۳. کپی به ادمین‌ها (هم‌زمان، بدون منتظر موندن)
+    for tid in targets:
+        bg_tasks.append(asyncio.create_task(
+            context.bot.send_message(chat_id=tid, text=admin_text, parse_mode="HTML")
+        ))
+
+    # ── ارسال به گروه (اولویت اول، فوری) ──
+    try:
+        if reply_to_msg_id:
+            await context.bot.send_message(
+                chat_id=chat.id, text=group_text, parse_mode="Markdown",
+                reply_to_message_id=reply_to_msg_id,
+            )
+        else:
+            await context.bot.send_message(chat_id=chat.id, text=group_text, parse_mode="Markdown")
+    except TelegramError as e:
+        logger.exception(f"خطا در ارسال پیام ناشناس: {e}")
+
+    # ── منتظر موندن برای تسک‌های پس‌زمینه (فقط برای اطمینان) ──
+    if bg_tasks:
+        await asyncio.gather(*bg_tasks, return_exceptions=True)
+
+    # لاگ
     try:
         with open("anon_logs.txt", "a", encoding="utf-8") as f:
-            f.write(f"{datetime.now()} | chat={chat.id} | title={chat.title} | user={user.id} | "
-                    f"name={user.first_name} | sent={sent_to_admins} | text={anon_text[:50]}\n")
+            f.write(f"{datetime.now()} | chat={chat.id} | user={user.id} | text={anon_text[:50]}\n")
     except OSError:
         pass
 
-    logger.info(f"✅ پیام ناشناس از {chat.title} → {sent_to_admins} ادمین (موازی)")
-# ==========================================
-# main
+
 # ==========================================
 def main() -> None:
     TOKEN_STR = TOKEN.strip()
@@ -2494,6 +2548,7 @@ def main() -> None:
 
     # ۲. دستورات اسلش
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("whoami", lambda u, c: u.message.reply_text(f"🆔 آیدی عددی شما: `{u.effective_user.id}`", parse_mode="Markdown")))
     app.add_handler(CommandHandler("panel", panel_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("sik", kick_user))
