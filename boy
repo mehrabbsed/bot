@@ -75,6 +75,10 @@ def _is_creator_question(text: str) -> bool:
     return any(re.search(p, t, re.IGNORECASE) for p in CREATOR_PATTERNS)
 
 
+def cache_key(chat_id, message_id):
+    return f"{chat_id}:{message_id}"
+
+
 async def creator_reply(update, context):
     message = update.effective_message
     chat = update.effective_chat
@@ -114,10 +118,8 @@ data = {
     "message_counts": {}, "join_dates": {},
     "banned": {},
     "muted": {},
+    "message_cache": {},
 }
-
-# ── کش متن پیام‌ها برای تشخیص ویرایش ──
-_message_cache = {}  # key: (chat_id, message_id) → text
 
 
 async def log_allowed_groups(app: Application):
@@ -195,8 +197,6 @@ async def require_admin(update, context):
     return False
 
 
-
-
 async def reply_and_delete(update, text, reply_markup=None):
     message = update.effective_message
     chat = update.effective_chat
@@ -212,7 +212,6 @@ async def reply_and_delete(update, text, reply_markup=None):
             logger.exception("خطا در ارسال پاسخ")
             return
 
-    # ── لاگ پاک‌سازی پیام دستور (فقط برای ادمین‌ها) ──
     if (chat and user and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
             and not user.is_bot):
         try:
@@ -234,7 +233,6 @@ async def reply_and_delete(update, text, reply_markup=None):
     except TelegramError:
         pass
 
-    
 async def get_user_display(chat_id, user_id, context):
     try:
         member = await context.bot.get_chat_member(chat_id, user_id)
@@ -270,7 +268,7 @@ async def get_cached_admin_ids(chat_id, context):
 
 
 # ==========================================
-# لاگ پاک‌سازی (مثل پیام ناشناس)
+# لاگ پاک‌سازی
 # ==========================================
 async def notify_delete(context, chat, user, message, reason: str):
     if not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
@@ -324,7 +322,7 @@ async def notify_delete(context, chat, user, message, reason: str):
 
 
 # ==========================================
-# لاگ ویرایش (مثل پیام ناشناس)
+# لاگ ویرایش
 # ==========================================
 async def notify_edit(context, chat, user, old_text: str, new_text: str):
     if not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
@@ -380,6 +378,8 @@ async def notify_edit(context, chat, user, old_text: str, new_text: str):
 
 
 async def on_message_edited(update, context):
+    logger.info("🔔 on_message_edited صدا زده شد")
+
     message = update.edited_message
     chat = update.effective_chat
     user = update.effective_user
@@ -397,19 +397,26 @@ async def on_message_edited(update, context):
     if not new_text:
         return
 
-    key = (chat.id, message.message_id)
-    old_text = _message_cache.get(key)
+    key = cache_key(chat.id, message.message_id)
+    old_text = data["message_cache"].get(key)
+
+    logger.info(f"🔍 ویرایش: key={key} | old_text={old_text} | new_text={new_text[:30]}")
 
     if old_text is None:
-        _message_cache[key] = new_text
+        data["message_cache"][key] = new_text
+        save_data()
+        logger.info(f"⚠️ متن قبلی نبود، فقط کش شد: {key}")
         return
 
     if old_text == new_text:
-        _message_cache[key] = new_text
+        data["message_cache"][key] = new_text
+        save_data()
         return
 
     await notify_edit(context, chat, user, old_text, new_text)
-    _message_cache[key] = new_text
+    data["message_cache"][key] = new_text
+    save_data()
+    logger.info(f"✅ لاگ ویرایش ارسال شد: {key}")
 
 
 # ==========================================
@@ -1230,6 +1237,8 @@ async def count_messages(update, context):
         data["message_counts"] = {}
     if not isinstance(data.get("join_dates"), dict):
         data["join_dates"] = {}
+    if not isinstance(data.get("message_cache"), dict):
+        data["message_cache"] = {}
 
     try:
         current = int(data["message_counts"].get(key, 0))
@@ -1247,7 +1256,9 @@ async def count_messages(update, context):
     if msg:
         msg_text = msg.text or msg.caption or ""
         if msg_text:
-            _message_cache[(ck, msg.message_id)] = msg_text
+            cache_key_str = cache_key(ck, msg.message_id)
+            data["message_cache"][cache_key_str] = msg_text
+            logger.info(f"💾 کش شد: {cache_key_str} → «{msg_text[:30]}»")
 
     save_data()
     logger.info(f"📊 شمارش پیام: {key} → {data['message_counts'][key]}")
