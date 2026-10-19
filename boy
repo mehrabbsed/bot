@@ -917,9 +917,13 @@ async def member_action(update, context, action):
             uk = user_key(target.id)
             ident = data["identities"].get(identity_key(chat.id, target.id), "ثبت نشده")
             warns = data["warns"].get(ck, {}).get(uk, 0)
-            msg_count = data["message_counts"].get(f"{ck}:{uk}", 0)
 
-            join_date = data["join_dates"].get(f"{ck}:{uk}", "نامشخص")
+            # ✅ اصلاح کلید تعداد پیام
+            msg_key = f"{ck}:{uk}"
+            msg_count = data["message_counts"].get(msg_key, 0)
+            logger.info(f"🔍 پروفایل: {msg_key} → {msg_count} پیام")
+
+            join_date = data["join_dates"].get(msg_key, "نامشخص")
             if join_date == "نامشخص":
                 try:
                     m = await context.bot.get_chat_member(chat.id, target.id)
@@ -1067,8 +1071,35 @@ async def welcome_new_members(update, context):
 
 
 # ==========================================
-# شمارش پیام‌ها
+# شمارش پیام‌ها + ثبت آیدی
 # ==========================================
+async def record_known_user(update, context):
+    """هر کاربری که هر پیامی (حتی کامند) بفرسته، آیدیش توی دیتابیس ثبت میشه."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user:
+        return
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    if not is_allowed_chat(chat.id):
+        return
+    if user.is_bot:
+        return
+
+    ck = chat_key(chat.id)
+    uk = user_key(user.id)
+    key = f"{ck}:{uk}"
+
+    if key not in data["message_counts"]:
+        data["message_counts"][key] = 0
+
+    if key not in data["join_dates"]:
+        now = datetime.now()
+        jalali = jdatetime.datetime.fromgregorian(datetime=now)
+        data["join_dates"][key] = jalali.strftime("%Y/%m/%d")
+        save_data()
+
+
 async def count_messages(update, context):
     if not update.effective_chat or not update.effective_user:
         return
@@ -1077,15 +1108,28 @@ async def count_messages(update, context):
     if not is_allowed_chat(update.effective_chat.id):
         return
 
+    user = update.effective_user
+    if user.is_bot:
+        return
+
     ck = chat_key(update.effective_chat.id)
-    uk = user_key(update.effective_user.id)
+    uk = user_key(user.id)
     key = f"{ck}:{uk}"
 
     data["message_counts"].setdefault(key, 0)
     data["message_counts"][key] += 1
 
-    if data["message_counts"][key] % 5 == 0:
+    if key not in data["join_dates"]:
+        now = datetime.now()
+        jalali = jdatetime.datetime.fromgregorian(datetime=now)
+        data["join_dates"][key] = jalali.strftime("%Y/%m/%d")
+
+    # ✅ ذخیره‌ی مطمئن‌تر — هر ۳ پیام یه بار
+    data["_save_counter"] = data.get("_save_counter", 0) + 1
+    if data["_save_counter"] % 3 == 0:
         save_data()
+
+    logger.info(f"📊 شمارش پیام: {key} → {data['message_counts'][key]}")
 
 
 # ==========================================
@@ -2213,80 +2257,103 @@ async def tag_all(update, context):
         elif replied.caption:
             reply_text = f"\n\n💬 **کپشن ریپلای‌شده:**\n{replied.caption[:200]}"
 
+    ck = chat_key(chat.id)
+
     try:
         admins = await context.bot.get_chat_administrators(chat.id)
         admin_ids = {a.user.id for a in admins}
     except TelegramError:
         admin_ids = set()
 
+    user_ids_to_tag = set(admin_ids)
+
+    for source in ("message_counts", "join_dates"):
+        for key in data.get(source, {}).keys():
+            if key.startswith(f"{ck}:"):
+                try:
+                    user_ids_to_tag.add(int(key.split(":", 1)[1]))
+                except (ValueError, IndexError):
+                    pass
+
+    for source in ("warns", "muted", "banned"):
+        for uk in data.get(source, {}).get(ck, {}).keys():
+            try:
+                user_ids_to_tag.add(int(uk))
+            except (ValueError, TypeError):
+                pass
+
+    for key in data.get("identities", {}).keys():
+        if key.startswith(f"{ck}:"):
+            try:
+                user_ids_to_tag.add(int(key.split(":", 1)[1]))
+            except (ValueError, IndexError):
+                pass
+
+    for uk in data.get("special", {}).get(ck, []):
+        try:
+            user_ids_to_tag.add(int(uk))
+        except (ValueError, TypeError):
+            pass
+
+    user_ids_to_tag.discard(context.bot.id)
+
+    if not user_ids_to_tag:
+        await reply_and_delete(update, "⚠️ هیچ عضوی برای تگ کردن پیدا نشد!")
+        return
+
     mentions = []
     count = 0
     MAX_PER_MESSAGE = 50
+    seen_ids = set()
 
-    try:
-        user_ids_to_tag = set(admin_ids)
-        for key in data.get("message_counts", {}).keys():
-            if key.startswith(f"{chat_key(chat.id)}:"):
-                try:
-                    user_ids_to_tag.add(int(key.split(":")[1]))
-                except (ValueError, IndexError):
-                    pass
-        for key in data.get("join_dates", {}).keys():
-            if key.startswith(f"{chat_key(chat.id)}:"):
-                try:
-                    user_ids_to_tag.add(int(key.split(":")[1]))
-                except (ValueError, IndexError):
-                    pass
-        user_ids_to_tag.discard(context.bot.id)
-
-        if not user_ids_to_tag:
-            await reply_and_delete(update, "⚠️ هیچ عضوی برای تگ کردن پیدا نشد!")
-            return
-
-        for uid in user_ids_to_tag:
-            try:
-                member = await context.bot.get_chat_member(chat.id, uid)
-                if member.user.is_bot:
-                    continue
-                if member.status == ChatMemberStatus.LEFT:
-                    continue
-                if member.status == ChatMemberStatus.RESTRICTED and not getattr(member, "is_member", False):
-                    continue
-                mentions.append(f"[{member.user.first_name}](tg://user?id={uid})")
-                count += 1
-            except TelegramError:
+    for uid in user_ids_to_tag:
+        if uid in seen_ids:
+            continue
+        seen_ids.add(uid)
+        try:
+            member = await context.bot.get_chat_member(chat.id, uid)
+            if member.user.is_bot:
                 continue
+            if member.status == ChatMemberStatus.LEFT:
+                continue
+            if member.status == ChatMemberStatus.RESTRICTED and not getattr(member, "is_member", False):
+                continue
+            name = member.user.first_name or "کاربر"
+            safe_name = name.replace("[", "").replace("]", "").replace("(", "").replace(")", "")
+            mentions.append(f"[{safe_name}](tg://user?id={uid})")
+            count += 1
+        except TelegramError:
+            continue
 
-            if len(mentions) >= MAX_PER_MESSAGE:
-                try:
-                    await context.bot.send_message(
-                        chat_id=chat.id,
-                        text=f"{custom_text}{reply_text}\n\n" + " ".join(mentions),
-                        parse_mode="Markdown",
-                    )
-                except TelegramError as e:
-                    logger.exception(f"خطا در ارسال تگ: {e}")
-                mentions = []
-
-        if mentions:
+        if len(mentions) >= MAX_PER_MESSAGE:
             try:
                 await context.bot.send_message(
                     chat_id=chat.id,
                     text=f"{custom_text}{reply_text}\n\n" + " ".join(mentions),
                     parse_mode="Markdown",
+                    disable_web_page_preview=True,
                 )
             except TelegramError as e:
                 logger.exception(f"خطا در ارسال تگ: {e}")
+            mentions = []
 
+    if mentions:
         try:
-            await message.delete()
-        except TelegramError:
-            pass
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text=f"{custom_text}{reply_text}\n\n" + " ".join(mentions),
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
+            )
+        except TelegramError as e:
+            logger.exception(f"خطا در ارسال تگ: {e}")
 
-        logger.info(f"✅ تگ {count} نفر انجام شد")
-    except TelegramError as e:
-        logger.exception(f"خطا در تگ: {e}")
-        await reply_and_delete(update, f"❌ خطا در تگ کردن: {e}")
+    try:
+        await message.delete()
+    except TelegramError:
+        pass
+
+    logger.info(f"✅ تگ {count} نفر انجام شد")
 
 
 async def tag_admins(update, context):
@@ -2367,34 +2434,6 @@ async def tag_active(update, context):
 # ==========================================
 # پیام ناشناس
 # ==========================================
-import asyncio  # ← این رو بالای فایل اضافه کن (اگه نیست)
-
-# ==========================================
-# پیام ناشناس
-# ==========================================
-import asyncio
-
-# ── ⚠️ اینجا آیدی عددی خودت رو بذار ──
-MY_USER_ID = 5695691254  # ← آیدی عددی تلگرام خودت رو جایگزین کن
-
-
-# ==========================================
-# پیام ناشناس
-# ==========================================
-import asyncio
-
-# ── ⚠️ اینجا آیدی عددی خودت رو بذار ──
-MY_USER_ID = 123456789  # ← آیدی عددی تلگرام خودت رو جایگزین کن
-
-
-# ==========================================
-
-# ==========================================
-# پیام ناشناس
-# ==========================================
-# ==========================================
-# پیام ناشناس (سریع‌ترین نسخه ممکن)
-# ==========================================
 import asyncio
 import time
 
@@ -2463,7 +2502,6 @@ async def anon_command(update, context):
     if message.reply_to_message:
         reply_to_msg_id = message.reply_to_message.message_id
 
-    # ── متن‌ها ──
     group_text = f"🕵️ **کاربر ناشناس**\n\n{anon_text}"
     admin_text = (
         f"🕵️ **پیام ناشناس جدید**\n\n"
@@ -2475,14 +2513,11 @@ async def anon_command(update, context):
         f"💬 **متن پیام:**\n{anon_text}"
     )
 
-    # ── گرفتن لیست ادمین‌ها (از کش) ──
     admin_ids = await get_cached_admin_ids(chat.id, context)
     targets = [uid for uid in admin_ids if uid != user.id and uid != MY_USER_ID]
 
-    # ── تسک‌های پس‌زمینه ──
     bg_tasks = []
 
-    # ۱. پاک کردن پیام کاربر
     async def delete_user_msg():
         try:
             await message.delete()
@@ -2490,7 +2525,6 @@ async def anon_command(update, context):
             pass
     bg_tasks.append(asyncio.create_task(delete_user_msg()))
 
-    # ۲. کپی به خودت
     if MY_USER_ID and MY_USER_ID != user.id:
         bg_tasks.append(asyncio.create_task(
             context.bot.send_message(
@@ -2500,13 +2534,11 @@ async def anon_command(update, context):
             )
         ))
 
-    # ۳. کپی به ادمین‌ها (هم‌زمان، بدون منتظر موندن)
     for tid in targets:
         bg_tasks.append(asyncio.create_task(
             context.bot.send_message(chat_id=tid, text=admin_text, parse_mode="HTML")
         ))
 
-    # ── ارسال به گروه (اولویت اول، فوری) ──
     try:
         if reply_to_msg_id:
             await context.bot.send_message(
@@ -2518,11 +2550,9 @@ async def anon_command(update, context):
     except TelegramError as e:
         logger.exception(f"خطا در ارسال پیام ناشناس: {e}")
 
-    # ── منتظر موندن برای تسک‌های پس‌زمینه (فقط برای اطمینان) ──
     if bg_tasks:
         await asyncio.gather(*bg_tasks, return_exceptions=True)
 
-    # لاگ
     try:
         with open("anon_logs.txt", "a", encoding="utf-8") as f:
             f.write(f"{datetime.now()} | chat={chat.id} | user={user.id} | text={anon_text[:50]}\n")
@@ -2582,8 +2612,11 @@ def main() -> None:
     # ۵. قفل لینک
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, check_link_lock), group=0)
 
-    # ۶. شمارش پیام
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, count_messages), group=0)
+    # ✅ ۶. شمارش پیام — همه‌ی پیام‌ها (حتی کامندها)
+    app.add_handler(
+        MessageHandler(filters.ALL & ~filters.UpdateType.EDITED_MESSAGE, count_messages),
+        group=0,
+    )
 
     # ۷. خوش‌آمد
     app.add_handler(ChatMemberHandler(welcome_new_members, ChatMemberHandler.CHAT_MEMBER))
